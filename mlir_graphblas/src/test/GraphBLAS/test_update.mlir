@@ -80,7 +80,7 @@ module {
     // input -> output(mask) { replace }
     //
     // CHECK:      Test 40
-    // CHECK-NEXT: [_, -1.2, _, _, _, _, _, _, _, _] 
+    // CHECK-NEXT: [_, -1.2, _, _, _, _, _, _, _, _]
     //
     graphblas.print %c0 { strings=["Test 4"] } : index
     %23 = graphblas.dup %v1 : tensor<?xf64, #CV64>
@@ -107,16 +107,14 @@ module {
     graphblas.update %v2 -> %25(%mask) { accumulate_operator = "plus" } : tensor<?xf64, #CV64> -> tensor<?xf64, #CV64>(tensor<?xf64, #CV64>)
     graphblas.print %25 { strings=[] } : tensor<?xf64, #CV64>
 
-    // COM: TODO This doesn't work yet.
-    // COM: input -> output(mask) { accumulate_operator, replace }
-    // COM: 
-    // COM: CHECK:      Test 70
-    // COM: CHECK-NEXT: [_, 8.8, _, 11, _, _, _, _, _, _]
-    // COM: 
-    // COM: graphblas.print %c0 { strings=["Test 7"] } : index
-    // COM: %26 = graphblas.dup %v1 : tensor<?xf64, #CV64>
-    // COM: graphblas.update %v2 -> %26(%mask) { accumulate_operator = "plus", replace = true } : tensor<?xf64, #CV64> -> tensor<?xf64, #CV64>(tensor<?xf64, #CV64>)
-    // COM: graphblas.print %26 { strings=[] } : tensor<?xf64, #CV64>
+    // input -> output(mask) { accumulate_operator, replace }
+    //
+    // CHECK:      Test 70
+    // CHECK-NEXT: [_, 8.8, _, 11, _, _, _, _, _, _]
+    graphblas.print %c0 { strings=["Test 7"] } : index
+    %26 = graphblas.dup %v1 : tensor<?xf64, #CV64>
+    graphblas.update %v2 -> %26(%mask) { accumulate_operator = "plus", replace = true } : tensor<?xf64, #CV64> -> tensor<?xf64, #CV64>(tensor<?xf64, #CV64>)
+    graphblas.print %26 { strings=[] } : tensor<?xf64, #CV64>
 
     ///////////////
     // Test Matrix

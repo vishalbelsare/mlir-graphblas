@@ -204,259 +204,49 @@ std::string buildSparseTypeString(RankedTensorType tensorType) {
 
 void callPrintTensor(OpBuilder &builder, ModuleOp &mod, Location loc,
                      Value input) {
-  callPrintString(builder, mod, loc, "[");
-
-  sparse_tensor::SparseTensorEncodingAttr sparseEncoding =
-      sparse_tensor::getSparseTensorEncoding(input.getType());
-  bool inputIsDense = !sparseEncoding;
-  StringRef missingValueString = inputIsDense ? "0" : "_";
-
-  RankedTensorType inputType = input.getType().dyn_cast<RankedTensorType>();
-  Type inputValueType = inputType.getElementType();
-
-  Value c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
-  Value c1 = builder.create<arith::ConstantIndexOp>(loc, 1);
-  Type indexType = builder.getIndexType();
-  Type int64Type = builder.getIntegerType(64);
-  Type boolType = builder.getIntegerType(1);
-  Type memref1DI64Type = MemRefType::get({-1}, int64Type);
-  Type memref1DValueType = MemRefType::get({-1}, inputValueType);
-
-  if (inputType.getRank() == 1) {
-    if (inputIsDense) {
-      MLIRContext *context = mod.getContext();
-      inputType = getCompressedVectorType(context, inputValueType);
-      // TODO: this is a hack and is very slow ; convert to an MLIR vector and
-      // use vector.print
-      input = builder.create<sparse_tensor::ConvertOp>(loc, inputType, input);
-    }
-
-    Value inputIndices = builder.create<sparse_tensor::ToIndicesOp>(
-        loc, memref1DI64Type, input, c0);
-    Value inputValues = builder.create<sparse_tensor::ToValuesOp>(
-        loc, memref1DValueType, input);
-    Value vectorLength = builder.create<graphblas::SizeOp>(loc, input);
-    Value vectorLengthMinusOne =
-        builder.create<arith::SubIOp>(loc, vectorLength, c1);
-
-    Value nnz = builder.create<graphblas::NumValsOp>(loc, input);
-    Value hasNoEntries =
-        builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq, nnz, c0);
-    scf::IfOp ifHasNoEntries = builder.create<scf::IfOp>(
-        loc, TypeRange{indexType, inputValueType}, hasNoEntries, true);
-    builder.setInsertionPointToStart(ifHasNoEntries.thenBlock());
-    {
-      // Choose index that will never be reached and placeholder initial value
-      Value typedPlaceholder =
-          llvm::TypeSwitch<Type, Value>(inputValueType)
-              .Case<IntegerType>([&](IntegerType type) {
-                return builder.create<arith::ConstantIntOp>(loc, -1,
-                                                            type.getWidth());
-              })
-              .Case<FloatType>([&](FloatType type) {
-                return builder.create<arith::ConstantFloatOp>(
-                    loc, APFloat(-1.0), type);
-              });
-      builder.create<scf::YieldOp>(loc,
-                                   ValueRange{vectorLength, typedPlaceholder});
-    }
-    builder.setInsertionPointToStart(ifHasNoEntries.elseBlock());
-    {
-      Value firstValuesValue =
-          builder.create<memref::LoadOp>(loc, inputValues, c0);
-      Value firstIndicesValue_i64 =
-          builder.create<memref::LoadOp>(loc, inputIndices, c0);
-      Value firstIndicesValue = builder.create<arith::IndexCastOp>(
-          loc, firstIndicesValue_i64, indexType);
-      builder.create<scf::YieldOp>(
-          loc, ValueRange{firstIndicesValue, firstValuesValue});
-    }
-    builder.setInsertionPointAfter(ifHasNoEntries);
-
-    scf::ForOp forEachLoop =
-        builder.create<scf::ForOp>(loc, c0, vectorLength, c1,
-                                   ValueRange{c0, ifHasNoEntries.getResult(0),
-                                              ifHasNoEntries.getResult(1)});
-    {
-      builder.setInsertionPointToStart(forEachLoop.getBody());
-      Value toPrintPosition = forEachLoop.getInductionVar();
-      Value inputValuesAndIndicesPosition =
-          forEachLoop.getLoopBody().getArgument(1);
-      Value inputIndicesValue = forEachLoop.getLoopBody().getArgument(2);
-      Value inputValuesValue = forEachLoop.getLoopBody().getArgument(3);
-
-      Value printPresentValue = builder.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::eq, inputIndicesValue, toPrintPosition);
-      scf::IfOp ifPrintPresentValue = builder.create<scf::IfOp>(
-          loc, TypeRange{indexType, indexType, inputValueType},
-          printPresentValue, true);
-      {
-        builder.setInsertionPointToStart(ifPrintPresentValue.thenBlock());
-        {
-          callPrintValue(builder, mod, loc, inputValuesValue);
-          Value updatedInputValuesAndIndicesPosition =
-              builder.create<arith::AddIOp>(loc, inputValuesAndIndicesPosition,
-                                            c1);
-          Value updatedInputIndicesValue_i64 = builder.create<memref::LoadOp>(
-              loc, inputIndices, updatedInputValuesAndIndicesPosition);
-          Value updatedInputIndicesValue = builder.create<arith::IndexCastOp>(
-              loc, updatedInputIndicesValue_i64, indexType);
-          Value updatedInputValuesValue = builder.create<memref::LoadOp>(
-              loc, inputValues, updatedInputValuesAndIndicesPosition);
-          builder.create<scf::YieldOp>(
-              loc,
-              ValueRange{updatedInputValuesAndIndicesPosition,
-                         updatedInputIndicesValue, updatedInputValuesValue});
-        }
-        builder.setInsertionPointToStart(ifPrintPresentValue.elseBlock());
-        {
-          callPrintString(builder, mod, loc, missingValueString);
-          builder.create<scf::YieldOp>(
-              loc, ValueRange{inputValuesAndIndicesPosition, inputIndicesValue,
-                              inputValuesValue});
-        }
-        builder.setInsertionPointAfter(ifPrintPresentValue);
-      }
-
-      Value notLastPosition = builder.create<arith::CmpIOp>(
-          loc, arith::CmpIPredicate::ne, vectorLengthMinusOne, toPrintPosition);
-      scf::IfOp ifNotLastPosition =
-          builder.create<scf::IfOp>(loc, TypeRange{}, notLastPosition, false);
-      {
-        builder.setInsertionPointToStart(ifNotLastPosition.thenBlock());
-        callPrintString(builder, mod, loc, ", ");
-        builder.setInsertionPointAfter(ifNotLastPosition);
-      }
-
-      Value nextInputValuesAndIndicesPosition =
-          ifPrintPresentValue.getResult(0);
-      Value nextInputIndicesValue = ifPrintPresentValue.getResult(1);
-      Value nextInputValuesValue = ifPrintPresentValue.getResult(2);
-      builder.create<scf::YieldOp>(
-          loc, ValueRange{nextInputValuesAndIndicesPosition,
-                          nextInputIndicesValue, nextInputValuesValue});
-      builder.setInsertionPointAfter(forEachLoop);
-    }
-  } else {
-    if (inputIsDense) {
-      MLIRContext *context = mod.getContext();
-      inputType = getCSRType(context, inputValueType);
-      // TODO: this is a hack and is very slow ; convert to an MLIR vector and
-      // use vector.print
-      input = builder.create<sparse_tensor::ConvertOp>(loc, inputType, input);
-    } else if (!hasRowOrdering(inputType)) {
-      MLIRContext *context = mod.getContext();
-      inputType = getCSRType(context, inputValueType);
-      input = builder.create<graphblas::ConvertLayoutOp>(loc, inputType, input);
-    }
-    Value nrows = builder.create<graphblas::NumRowsOp>(loc, input);
-    Value ncols = builder.create<graphblas::NumColsOp>(loc, input);
-    Value ncolsMinusOne = builder.create<arith::SubIOp>(loc, ncols, c1);
-
+  std::string funcName = "print_tensor_dense";
+  RankedTensorType tensorType = input.getType().dyn_cast<RankedTensorType>();
+  int64_t rank = tensorType.getRank();
+  MLIRContext *context = mod.getContext();
+  if (rank == 2) {
     sparse_tensor::SparseTensorEncodingAttr sparseEncoding =
-        sparse_tensor::getSparseTensorEncoding(inputType);
-    unsigned pointerBitWidth = sparseEncoding.getPointerBitWidth();
-    Type pointerType = builder.getIntegerType(pointerBitWidth);
-    Type memref1DPointerType = MemRefType::get({-1}, pointerType);
-
-    Value matrixPointers = builder.create<sparse_tensor::ToPointersOp>(
-        loc, memref1DPointerType, input, c1);
-    Value matrixIndices = builder.create<sparse_tensor::ToIndicesOp>(
-        loc, memref1DI64Type, input, c1);
-    Value matrixValues = builder.create<sparse_tensor::ToValuesOp>(
-        loc, memref1DValueType, input);
-    scf::ForOp forRowLoop = builder.create<scf::ForOp>(loc, c0, nrows, c1);
-    {
-      builder.setInsertionPointToStart(forRowLoop.getBody());
-
-      Value matrixRowIndex = forRowLoop.getInductionVar();
-      Value nextMatrixRowIndex =
-          builder.create<arith::AddIOp>(loc, matrixRowIndex, c1).getResult();
-      Value firstPtr64 =
-          builder.create<memref::LoadOp>(loc, matrixPointers, matrixRowIndex);
-      Value firstPtr =
-          builder.create<arith::IndexCastOp>(loc, firstPtr64, indexType);
-      Value secondPtr64 = builder.create<memref::LoadOp>(loc, matrixPointers,
-                                                         nextMatrixRowIndex);
-      Value secondPtr =
-          builder.create<arith::IndexCastOp>(loc, secondPtr64, indexType);
-
-      callPrintString(builder, mod, loc, "\n  [");
-      scf::ForOp forColLoop =
-          builder.create<scf::ForOp>(loc, c0, ncols, c1, ValueRange{firstPtr});
-      {
-        builder.setInsertionPointToStart(forColLoop.getBody());
-        Value toPrintPosition = forColLoop.getInductionVar();
-        Value ptr = forColLoop.getLoopBody().getArgument(1);
-
-        Value ptrIsValid = builder.create<arith::CmpIOp>(
-            loc, arith::CmpIPredicate::ult, ptr, secondPtr);
-        scf::IfOp ifPtrIsValid = builder.create<scf::IfOp>(
-            loc, TypeRange{boolType}, ptrIsValid, true);
-        {
-          builder.setInsertionPointToStart(ifPtrIsValid.thenBlock());
-          {
-            Value col_i64 =
-                builder.create<memref::LoadOp>(loc, matrixIndices, ptr);
-            Value col =
-                builder.create<arith::IndexCastOp>(loc, col_i64, indexType);
-            Value colEqualsToPrintPosition = builder.create<arith::CmpIOp>(
-                loc, arith::CmpIPredicate::eq, col, toPrintPosition);
-            builder.create<scf::YieldOp>(loc,
-                                         ValueRange{colEqualsToPrintPosition});
-          }
-          builder.setInsertionPointToStart(ifPtrIsValid.elseBlock());
-          {
-            Value false_i1 =
-                builder.create<arith::ConstantIntOp>(loc, 0, boolType);
-            builder.create<scf::YieldOp>(loc, ValueRange{false_i1});
-          }
-          builder.setInsertionPointAfter(ifPtrIsValid);
-        }
-        Value printPresentValue = ifPtrIsValid.getResult(0);
-
-        scf::IfOp ifPrintPresentValue = builder.create<scf::IfOp>(
-            loc, TypeRange{indexType}, printPresentValue, true);
-        {
-          builder.setInsertionPointToStart(ifPrintPresentValue.thenBlock());
-          {
-            Value matrixValue =
-                builder.create<memref::LoadOp>(loc, matrixValues, ptr);
-            callPrintValue(builder, mod, loc, matrixValue);
-            Value updatedPtr = builder.create<arith::AddIOp>(loc, ptr, c1);
-            builder.create<scf::YieldOp>(loc, ValueRange{updatedPtr});
-          }
-          builder.setInsertionPointToStart(ifPrintPresentValue.elseBlock());
-          {
-            callPrintString(builder, mod, loc, missingValueString);
-            builder.create<scf::YieldOp>(loc, ValueRange{ptr});
-          }
-          builder.setInsertionPointAfter(ifPrintPresentValue);
-        }
-
-        Value notLastCol = builder.create<arith::CmpIOp>(
-            loc, arith::CmpIPredicate::ne, ncolsMinusOne, toPrintPosition);
-        scf::IfOp ifNotLastCol =
-            builder.create<scf::IfOp>(loc, TypeRange{}, notLastCol, true);
-        {
-          builder.setInsertionPointToStart(ifNotLastCol.thenBlock());
-          callPrintString(builder, mod, loc, ", ");
-          builder.setInsertionPointToStart(ifNotLastCol.elseBlock());
-          callPrintString(builder, mod, loc, "],");
-          builder.setInsertionPointAfter(ifNotLastCol);
-        }
-
-        Value nextPtr = ifPrintPresentValue.getResult(0);
-        builder.create<scf::YieldOp>(loc, ValueRange{nextPtr});
-        builder.setInsertionPointAfter(forColLoop);
-      }
-
-      builder.setInsertionPointAfter(forRowLoop);
+        sparse_tensor::getSparseTensorEncoding(tensorType);
+    AffineMap dimOrdering = sparseEncoding.getDimOrdering();
+    unsigned dimOrdering0 = dimOrdering.getDimPosition(0);
+    unsigned dimOrdering1 = dimOrdering.getDimPosition(1);
+    bool isCSC = (dimOrdering0 == 1 && dimOrdering1 == 0);
+    if (isCSC) {
+      tensorType = getFlippedLayoutType(context, tensorType);
+      input = builder.create<sparse_tensor::ConvertOp>(loc, tensorType, input);
     }
-    callPrintString(builder, mod, loc, "\n");
   }
-  callPrintString(builder, mod, loc, "]");
 
+  ArrayRef<int64_t> shape = tensorType.getShape();
+  sparse_tensor::SparseTensorEncodingAttr sparseEncoding =
+      sparse_tensor::getSparseTensorEncoding(tensorType);
+  unsigned ptrBitWidth = sparseEncoding.getPointerBitWidth();
+  unsigned idxBitWidth = sparseEncoding.getIndexBitWidth();
+  Type inputValueType = tensorType.getElementType();
+  if (rank == 2) {
+    for (unsigned i = 0; i < shape.size(); i++) {
+      if (shape[i] != -1) {
+        tensorType = getSingleCompressedMatrixType(
+            context, ArrayRef<int64_t>{-1, -1}, false, inputValueType,
+            ptrBitWidth, idxBitWidth);
+        input = builder.create<tensor::CastOp>(loc, tensorType, input);
+        break;
+      }
+    }
+  } else if (rank == 1) {
+    if (shape[0] != -1) {
+      tensorType = getCompressedVectorType(context, inputValueType);
+      input = builder.create<tensor::CastOp>(loc, tensorType, input);
+    }
+  }
+  FlatSymbolRefAttr funcSymbol =
+      getFunc(mod, loc, funcName, TypeRange(), tensorType);
+  builder.create<CallOp>(loc, funcSymbol, TypeRange(),
+                         llvm::ArrayRef<Value>({input}));
   return;
 }
 
@@ -579,15 +369,16 @@ Value callEmptyLike(OpBuilder &builder, ModuleOp &mod, Location loc,
 
   unsigned rank = inputTensorType.getRank();
 
-  // Get the shape as a ValueRange
-  ValueRange shape;
+  // Get the shape
+  SmallVector<Value, 2> shape;
   if (rank == 1) {
     Value size = builder.create<graphblas::SizeOp>(loc, tensor);
-    shape = ValueRange{size};
+    shape.push_back(size);
   } else {
     Value nrows = builder.create<graphblas::NumRowsOp>(loc, tensor);
     Value ncols = builder.create<graphblas::NumColsOp>(loc, tensor);
-    shape = ValueRange{nrows, ncols};
+    shape.push_back(nrows);
+    shape.push_back(ncols);
   }
 
   return callNewTensor(builder, mod, loc, shape, rtt);
@@ -837,18 +628,24 @@ LogicalResult populateUnary(OpBuilder &builder, Location loc, StringRef unaryOp,
   Type indexType = builder.getIndexType();
   Type i1Type = builder.getI1Type();
   Type i8Type = builder.getI8Type();
+  Type i64Type = builder.getI64Type();
   Value false8 = builder.create<arith::ConstantIntOp>(loc, 0, i8Type);
   Value true8 = builder.create<arith::ConstantIntOp>(loc, 1, i8Type);
 
   // Insert unary operation
   Region *unaryRegion = regions[0];
-  TypeRange inputTypes;
-  if (unary1.contains(unaryOp))
-    inputTypes = TypeRange{valueType};
-  else if (unary3.contains(unaryOp))
-    inputTypes = TypeRange{valueType, indexType, indexType};
+  SmallVector<Type, 3> inputTypes;
+  SmallVector<Location, 3> locs;
+  inputTypes.push_back(valueType);
+  locs.push_back(loc);
+  if (unary3.contains(unaryOp)) {
+    inputTypes.push_back(indexType);
+    inputTypes.push_back(indexType);
+    locs.push_back(loc);
+    locs.push_back(loc);
+  }
 
-  Block *unaryBlock = builder.createBlock(unaryRegion, {}, inputTypes);
+  Block *unaryBlock = builder.createBlock(unaryRegion, {}, inputTypes, locs);
   int numArgs = unaryBlock->getArguments().size();
 
   Value val = unaryBlock->getArgument(0);
@@ -869,7 +666,7 @@ LogicalResult populateUnary(OpBuilder &builder, Location loc, StringRef unaryOp,
             .Case<IntegerType>([&](IntegerType type) {
               // http://graphics.stanford.edu/~seander/bithacks.html#IntegerAbs
               unsigned bitWidth = type.getWidth();
-              Value shiftAmount = builder.create<ConstantOp>(
+              Value shiftAmount = builder.create<arith::ConstantOp>(
                   loc, builder.getIntegerAttr(type, bitWidth - 1));
               Value mask =
                   builder.create<arith::ShRSIOp>(loc, val, shiftAmount);
@@ -882,7 +679,7 @@ LogicalResult populateUnary(OpBuilder &builder, Location loc, StringRef unaryOp,
   } else if (unaryOp == "ainv") {
     opResult = llvm::TypeSwitch<Type, Value>(valueType)
                    .Case<IntegerType>([&](IntegerType type) {
-                     Value c0_type = builder.create<ConstantOp>(
+                     Value c0_type = builder.create<arith::ConstantOp>(
                          loc, builder.getIntegerAttr(type, 0));
                      return builder.create<arith::SubIOp>(loc, c0_type, val);
                    })
@@ -952,7 +749,7 @@ LogicalResult populateUnary(OpBuilder &builder, Location loc, StringRef unaryOp,
               // TODO we're missing python tests for all ops when given
               // integer-typed tensors
               unsigned bitWidth = type.getWidth();
-              Value shiftAmount = builder.create<ConstantOp>(
+              Value shiftAmount = builder.create<arith::ConstantOp>(
                   loc, builder.getIntegerAttr(type, bitWidth - 1));
               Value mask =
                   builder.create<arith::ShRSIOp>(loc, val, shiftAmount);
@@ -995,12 +792,12 @@ LogicalResult populateUnary(OpBuilder &builder, Location loc, StringRef unaryOp,
   // Unary with three arguments
   ////////////////////////////////////
   else if (unaryOp == "column") {
-    opResult = col;
+    opResult = builder.create<arith::IndexCastOp>(loc, col, i64Type);
   } else if (unaryOp == "index") {
     // For Vectors, (row, col) is set as (index, index), so choose either
-    opResult = row;
+    opResult = builder.create<arith::IndexCastOp>(loc, row, i64Type);
   } else if (unaryOp == "row") {
-    opResult = row;
+    opResult = builder.create<arith::IndexCastOp>(loc, row, i64Type);
   } else if (unaryOp == "triu") {
     opResult =
         builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ugt, col, row);
@@ -1011,7 +808,7 @@ LogicalResult populateUnary(OpBuilder &builder, Location loc, StringRef unaryOp,
 
   // Cannot store i1 in sparse tensor, so convert to i8 if needed
   if (boolAsI8 && opResult.getType() == i1Type)
-    opResult = builder.create<SelectOp>(loc, opResult, true8, false8);
+    opResult = builder.create<arith::SelectOp>(loc, opResult, true8, false8);
 
   builder.create<graphblas::YieldOp>(loc, yieldKind, opResult);
 
@@ -1034,18 +831,26 @@ LogicalResult populateBinary(OpBuilder &builder, Location loc,
   // Insert binary operation
   Region *binaryRegion = regions[0];
   TypeRange inputTypes;
-  if (binary2.contains(binaryOp))
+  SmallVector<Location, 5> locs;
+  locs.push_back(loc);
+  locs.push_back(loc);
+  if (binary2.contains(binaryOp)) {
     inputTypes = TypeRange{valueType, valueType};
-  else if (binary4.contains(binaryOp))
+  } else if (binary4.contains(binaryOp)) {
     inputTypes = TypeRange{valueType, valueType, indexType, indexType};
-  else if (binary5.contains(binaryOp))
+    locs.push_back(loc);
+    locs.push_back(loc);
+  } else if (binary5.contains(binaryOp)) {
     inputTypes =
         TypeRange{valueType, valueType, indexType, indexType, indexType};
-  else
+    locs.push_back(loc);
+    locs.push_back(loc);
+    locs.push_back(loc);
+  } else
     return binaryRegion->getParentOp()->emitError(
         "\"" + binaryOp + "\" is not a supported binary operation.");
 
-  Block *binaryBlock = builder.createBlock(binaryRegion, {}, inputTypes);
+  Block *binaryBlock = builder.createBlock(binaryRegion, {}, inputTypes, locs);
   int numArgs = binaryBlock->getArguments().size();
 
   Value aVal = binaryBlock->getArgument(0);
@@ -1167,7 +972,7 @@ LogicalResult populateBinary(OpBuilder &builder, Location loc,
                       return builder.create<arith::CmpFOp>(
                           loc, arith::CmpFPredicate::OGT, aVal, bVal);
                     });
-    opResult = builder.create<SelectOp>(loc, cmp, aVal, bVal);
+    opResult = builder.create<arith::SelectOp>(loc, cmp, aVal, bVal);
   } else if (binaryOp == "min") {
     Value cmp = llvm::TypeSwitch<Type, Value>(valueType)
                     .Case<IntegerType>([&](IntegerType type) {
@@ -1178,7 +983,7 @@ LogicalResult populateBinary(OpBuilder &builder, Location loc,
                       return builder.create<arith::CmpFOp>(
                           loc, arith::CmpFPredicate::OLT, aVal, bVal);
                     });
-    opResult = builder.create<SelectOp>(loc, cmp, aVal, bVal);
+    opResult = builder.create<arith::SelectOp>(loc, cmp, aVal, bVal);
   } else if (binaryOp == "minus") {
     opResult = llvm::TypeSwitch<Type, Value>(valueType)
                    .Case<IntegerType>([&](IntegerType type) {
@@ -1283,7 +1088,7 @@ LogicalResult populateBinary(OpBuilder &builder, Location loc,
 
   // Cannot store i1 in sparse tensor, so convert to i8 if needed
   if (boolAsI8 && opResult.getType() == i1Type)
-    opResult = builder.create<SelectOp>(loc, opResult, true8, false8);
+    opResult = builder.create<arith::SelectOp>(loc, opResult, true8, false8);
 
   builder.create<graphblas::YieldOp>(loc, yieldKind, opResult);
 
@@ -1302,6 +1107,9 @@ LogicalResult populateMonoid(OpBuilder &builder, Location loc,
   Region *opRegion = regions[1];
 
   TypeRange inputTypes;
+  SmallVector<Location, 2> locs;
+  locs.push_back(loc);
+  locs.push_back(loc);
   if (monoid2.contains(monoidOp))
     inputTypes = TypeRange{valueType, valueType};
   else
@@ -1309,7 +1117,7 @@ LogicalResult populateMonoid(OpBuilder &builder, Location loc,
         "\"" + monoidOp + "\" is not a supported monoid.");
 
   // Insert monoid identity
-  /*Block *identityBlock = */ builder.createBlock(identityRegion, {}, {});
+  /*Block *identityBlock = */ builder.createBlock(identityRegion, {}, {}, {});
   Value identity;
   if (monoidOp == "any" || monoidOp == "lor" || monoidOp == "plus") {
     identity = llvm::TypeSwitch<Type, Value>(valueType)
@@ -1335,13 +1143,13 @@ LogicalResult populateMonoid(OpBuilder &builder, Location loc,
     identity =
         llvm::TypeSwitch<Type, Value>(valueType)
             .Case<IntegerType>([&](IntegerType type) {
-              return builder.create<ConstantOp>(
+              return builder.create<arith::ConstantOp>(
                   loc,
                   builder.getIntegerAttr(
                       valueType, APInt::getSignedMinValue(type.getWidth())));
             })
             .Case<FloatType>([&](FloatType type) {
-              return builder.create<ConstantOp>(
+              return builder.create<arith::ConstantOp>(
                   loc, builder.getFloatAttr(
                            valueType, APFloat::getLargest(
                                           type.getFloatSemantics(), true)));
@@ -1350,13 +1158,13 @@ LogicalResult populateMonoid(OpBuilder &builder, Location loc,
     identity =
         llvm::TypeSwitch<Type, Value>(valueType)
             .Case<IntegerType>([&](IntegerType type) {
-              return builder.create<ConstantOp>(
+              return builder.create<arith::ConstantOp>(
                   loc,
                   builder.getIntegerAttr(
                       valueType, APInt::getSignedMaxValue(type.getWidth())));
             })
             .Case<FloatType>([&](FloatType type) {
-              return builder.create<ConstantOp>(
+              return builder.create<arith::ConstantOp>(
                   loc, builder.getFloatAttr(
                            valueType, APFloat::getLargest(
                                           type.getFloatSemantics(), false)));
@@ -1366,7 +1174,7 @@ LogicalResult populateMonoid(OpBuilder &builder, Location loc,
   builder.create<graphblas::YieldOp>(loc, yieldIdentity, identity);
 
   // Insert operation
-  Block *opBlock = builder.createBlock(opRegion, {}, inputTypes);
+  Block *opBlock = builder.createBlock(opRegion, {}, inputTypes, locs);
   Value aVal = opBlock->getArgument(0);
   Value bVal = opBlock->getArgument(1);
   Value opResult;
@@ -1394,7 +1202,7 @@ LogicalResult populateMonoid(OpBuilder &builder, Location loc,
                       return builder.create<arith::CmpFOp>(
                           loc, arith::CmpFPredicate::OGT, aVal, bVal);
                     });
-    opResult = builder.create<SelectOp>(loc, cmp, aVal, bVal);
+    opResult = builder.create<arith::SelectOp>(loc, cmp, aVal, bVal);
   } else if (monoidOp == "min") {
     Value cmp = llvm::TypeSwitch<Type, Value>(valueType)
                     .Case<IntegerType>([&](IntegerType type) {
@@ -1405,7 +1213,7 @@ LogicalResult populateMonoid(OpBuilder &builder, Location loc,
                       return builder.create<arith::CmpFOp>(
                           loc, arith::CmpFPredicate::OLT, aVal, bVal);
                     });
-    opResult = builder.create<SelectOp>(loc, cmp, aVal, bVal);
+    opResult = builder.create<arith::SelectOp>(loc, cmp, aVal, bVal);
   } else if (monoidOp == "plus") {
     opResult = llvm::TypeSwitch<Type, Value>(valueType)
                    .Case<IntegerType>([&](IntegerType type) {

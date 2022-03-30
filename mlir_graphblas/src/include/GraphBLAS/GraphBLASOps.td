@@ -11,7 +11,7 @@ include "GraphBLASDialect.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 
-class GraphBLAS_Op<string mnemonic, list<OpTrait> traits = []> : Op<GraphBLAS_Dialect, mnemonic, traits> {}
+class GraphBLAS_Op<string mnemonic, list<Trait> traits = []> : Op<GraphBLAS_Dialect, mnemonic, traits> {}
 
 def GraphBlasMatrixOrVectorOperand : TensorRankOf<[AnyType], [1,2]>;
 def GraphBlasVectorOperand : 1DTensorOf<[AnyType]>;
@@ -352,19 +352,19 @@ def GraphBLAS_ReduceToVectorGenericOp : GraphBLAS_Op<"reduce_to_vector_generic",
 
         Example:
         ```mlir
-        %vec1 = graphblas.reduce_to_vector %matrix_1 { axis = 0 } : tensor<7x9xf16, #CSR64> to tensor<9xf16, #CV64> {
+        %vec1 = graphblas.reduce_to_vector_generic %matrix_1 { axis = 0 } : tensor<7x9xf16, #CSR64> to tensor<9xf16, #CV64> {
               graphblas.yield agg_identity %cf0 : f16
           },  {
             ^bb0(%a : f16, %b : f16):
               %result = arith.addf %a, %b : f16
               graphblas.yield agg %result : f16
           }
-        %vec2 = graphblas.reduce_to_vector %matrix_2, %mask { axis = 1, mask_complement = true } : tensor<7x9xi64, #CSR64>, tensor<7xi64, #CV64> to tensor<7xi64, #CV64> {
+        %vec2 = graphblas.reduce_to_vector_generic %matrix_2, %mask { axis = 1, mask_complement = true } : tensor<7x9xi64, #CSR64>, tensor<7xi64, #CV64> to tensor<7xi64, #CV64> {
               graphblas.yield agg_identity %ci0 : i64
           },  {
             ^bb0(%a : i64, %b : i64):
               %cmp = arith.cmpi "slt", %a, %b : i64
-              %result = select %cmp, %a, %b : i64
+              %result = arith.select %cmp, %a, %b : i64
               graphblas.yield agg %result : i64
           }
         ```
@@ -444,17 +444,20 @@ def GraphBLAS_ReduceToScalarGenericOp : GraphBLAS_Op<"reduce_to_scalar_generic",
     let verifier = [{ return ::verify(*this); }];
 }
 
-def GraphBLAS_ApplyOp : GraphBLAS_Op<"apply", [NoSideEffect]> {
+def GraphBLAS_ApplyOp : GraphBLAS_Op<"apply", []> {
     let summary = "Tensor element-wise apply operation.";
     let description = [{
         Applies in an element-wise fashion the function indicated by the ``apply_operator``
         attribute to each element of the given sparse tensor. The operator can be unary or
-        binary or the custom operator "identity". Binary operators require a thunk.
+        binary. Binary operators require a thunk. Most unary and binary operators are supported,
+        along with the custom "identity" apply operator.
+
+        If the boolean ``in_place`` attribute is `true`, then the changes will update the input
+        tensor in place. The ``in_place`` attribute has a default value of `false`.
+
+        Note that using the "identity" operator does not create a copy of the input tensor.
 
         The given sparse tensor must either be a CSR matrix, CSC matrix, or a sparse vector.
-
-        Using "minv" with integer types uses signed integer division and rounds towards
-        zero. For example, *minv(-2) == 1 / -2 == 0*.
 
         Some binary operators, e.g. "div", are not symmetric. The sparse tensor and thunk
         should be given in the order they should be given to the binary operator. For
@@ -477,8 +480,6 @@ def GraphBLAS_ApplyOp : GraphBLAS_Op<"apply", [NoSideEffect]> {
         matrix. Thus, the operation will not apply when the values are missing in the
         tensor. For example, *1.0 / [ _ , 2.0,  _ ] == [ _ , 0.5,  _ ]*.
 
-        Note that using the "identity" operator does not create a copy of the input tensor.
-
         The shape of the output tensor will match that of the input tensor.
 
         Example:
@@ -489,7 +490,7 @@ def GraphBLAS_ApplyOp : GraphBLAS_Op<"apply", [NoSideEffect]> {
         ```
     }];
 
-    let arguments = (ins AnyType:$left, Optional<AnyType>:$right, StrAttr:$apply_operator);
+    let arguments = (ins AnyType:$left, Optional<AnyType>:$right, StrAttr:$apply_operator, DefaultValuedAttr<BoolAttr, "false">:$in_place);
     let results = (outs GraphBlasMatrixOrVectorOperand:$output);
 
     let assemblyFormat = [{
@@ -499,11 +500,14 @@ def GraphBLAS_ApplyOp : GraphBLAS_Op<"apply", [NoSideEffect]> {
     let verifier = [{ return ::verify(*this); }];
 }
 
-def GraphBLAS_ApplyGenericOp : GraphBLAS_Op<"apply_generic", [NoSideEffect]> {
+def GraphBLAS_ApplyGenericOp : GraphBLAS_Op<"apply_generic", []> {
     let summary = "Generic tensor apply operation.";
     let description = [{
         Applies an arbitrary transformation to every element of a CSR or CSC matrix or sparse vector
-        according to the given transformation block. Only one transformation block is allowed.
+        according to the given transformation block. Only one transformation block is allowed. If
+        the boolean ``in_place`` attribute is set to `true`, then the changes will happen in place
+        and the input and output tensors will be the same identical tensor. The ``in_place``
+        attribute has a default value of `false`.
 
         Example:
         ```mlir
@@ -525,7 +529,7 @@ def GraphBLAS_ApplyGenericOp : GraphBLAS_Op<"apply_generic", [NoSideEffect]> {
         ```
     }];
 
-    let arguments = (ins GraphBlasMatrixOrVectorOperand:$input);
+    let arguments = (ins GraphBlasMatrixOrVectorOperand:$input, DefaultValuedAttr<BoolAttr, "false">:$in_place);
     let results = (outs GraphBlasMatrixOrVectorOperand:$output);
     let regions = (region VariadicRegion<SizedRegion<1>>:$extensions);
 
@@ -903,7 +907,7 @@ def GraphBLAS_UpdateGenericOp : GraphBLAS_Op<"update_generic", []> {
 
         Example:
         ```mlir
-        graphblas.update %other_mat -> %mat(%mask) { replace = true, mask_complement = true } :
+        graphblas.update_generic %other_mat -> %mat(%mask) { replace = true, mask_complement = true } :
             tensor<?x?xi64, #CSR64> -> tensor<?x?xf64, #CSR64>(tensor<?x?xf64, #CSR64>) {
             ^bb0(%a : f64, %b : f64):
               %result = arith.addf %a, %b : f64
@@ -911,7 +915,7 @@ def GraphBLAS_UpdateGenericOp : GraphBLAS_Op<"update_generic", []> {
         }
         ```
         ```mlir
-        graphblas.update %other_vec -> %vec : tensor<?xi64, #CV64> -> tensor<?xi64, #CV64> {
+        graphblas.update_generic %other_vec -> %vec : tensor<?xi64, #CV64> -> tensor<?xi64, #CV64> {
             ^bb0(%a : i64, %b : i64):
               %result = arith.muli %a, %b : i64
               graphblas.yield accumulate %result : i64
@@ -1294,7 +1298,7 @@ def GraphBLAS_FromCoordinatesOp : GraphBLAS_Op<"from_coo", [NoSideEffect]> {
         The indices must be *sorted* or things break badly.
 
         ```mlir
-        %v = graphblas.from_coo %indices, %vals : tensor<?xindex>, tensor<?xf64> to tensor<?xf64, #CSR64>
+        %v = graphblas.from_coo %indices, %vals : tensor<?xindex>, tensor<?xf64> to tensor<?x?xf64, #CSR64>
         ```
     }];
 
@@ -1320,7 +1324,7 @@ def GraphBLAS_ToCoordinatesOp : GraphBLAS_Op<"to_coo", [NoSideEffect]> {
         as `tensor<?xVALUE_TYPE>`
 
         ```mlir
-        %indices, %vals = graphblas.to_coo %v : tensor<?xf64, #CSR64> to tensor<?x?xindex>, tensor<?xf64>
+        %indices, %vals = graphblas.to_coo %v : tensor<?x?xf64, #CSR64> to tensor<?x?xindex>, tensor<?xf64>
         ```
     }];
 

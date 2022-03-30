@@ -16,12 +16,150 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "GraphBLAS/GraphBLASArrayUtils.h"
+#include "GraphBLAS/GraphBLASCommonPasses.h"
 #include "GraphBLAS/GraphBLASDialect.h"
 #include "GraphBLAS/GraphBLASPasses.h"
 #include "GraphBLAS/GraphBLASUtils.h"
 
 using namespace ::mlir;
 using namespace std::placeholders;
+
+LogicalResult
+LowerCommentRewrite::matchAndRewrite(graphblas::CommentOp op,
+                                     PatternRewriter &rewriter) const {
+  rewriter.eraseOp(op);
+  return success();
+};
+
+LogicalResult
+LowerPrintRewrite::matchAndRewrite(graphblas::PrintOp op,
+                                   PatternRewriter &rewriter) const {
+  ModuleOp module = op->getParentOfType<ModuleOp>();
+  Location loc = op->getLoc();
+
+  for (auto enumerated_pair :
+       llvm::enumerate(llvm::zip_longest(op.strings(), op.values()))) {
+    auto pair = enumerated_pair.value();
+    Optional<Attribute> stringAttribute = std::get<0>(pair);
+    Optional<Value> val = std::get<1>(pair);
+
+    if (stringAttribute) {
+      StringRef currentString =
+          stringAttribute.getValue().dyn_cast<StringAttr>().getValue();
+      callPrintString(rewriter, module, loc, currentString);
+    } else if (enumerated_pair.index() != 0)
+      callPrintString(rewriter, module, loc, " ");
+
+    if (!val)
+      callPrintString(rewriter, module, loc, " ");
+    else if (val.getValue().getType().dyn_cast_or_null<RankedTensorType>())
+      callPrintTensor(rewriter, module, loc, val.getValue());
+    else
+      callPrintValue(rewriter, module, loc, val.getValue());
+  }
+  callPrintString(rewriter, module, loc, "\n");
+
+  rewriter.eraseOp(op);
+
+  return success();
+};
+
+LogicalResult
+LowerPrintTensorRewrite::matchAndRewrite(graphblas::PrintTensorOp op,
+                                         PatternRewriter &rewriter) const {
+  ModuleOp module = op->getParentOfType<ModuleOp>();
+  Location loc = op->getLoc();
+  Value input = op.input();
+  int64_t level = op.level();
+
+  callPrintTensorComponents(rewriter, module, loc, input, level);
+
+  rewriter.eraseOp(op);
+
+  return success();
+};
+
+LogicalResult
+LowerSizeRewrite::matchAndRewrite(graphblas::SizeOp op,
+                                  PatternRewriter &rewriter) const {
+  Location loc = op->getLoc();
+
+  Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  Value inputTensor = op.input();
+  Value size = rewriter.create<tensor::DimOp>(loc, inputTensor, c0);
+
+  rewriter.replaceOp(op, size);
+  return success();
+};
+
+LogicalResult
+LowerNumRowsRewrite::matchAndRewrite(graphblas::NumRowsOp op,
+                                     PatternRewriter &rewriter) const {
+  Location loc = op->getLoc();
+
+  Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  Value inputTensor = op.input();
+  Value nrows = rewriter.create<tensor::DimOp>(loc, inputTensor, c0);
+
+  rewriter.replaceOp(op, nrows);
+  return success();
+};
+
+LogicalResult
+LowerNumColsRewrite::matchAndRewrite(graphblas::NumColsOp op,
+                                     PatternRewriter &rewriter) const {
+  Location loc = op->getLoc();
+
+  Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+  Value inputTensor = op.input();
+  Value ncols = rewriter.create<tensor::DimOp>(loc, inputTensor, c1);
+
+  rewriter.replaceOp(op, ncols);
+  return success();
+};
+
+LogicalResult
+LowerNumValsRewrite::matchAndRewrite(graphblas::NumValsOp op,
+                                     PatternRewriter &rewriter) const {
+  Location loc = op->getLoc();
+  Value inputTensor = op.input();
+  Type inputType = inputTensor.getType();
+
+  sparse_tensor::SparseTensorEncodingAttr sparseEncoding =
+      sparse_tensor::getSparseTensorEncoding(inputType);
+  unsigned pointerBitWidth = sparseEncoding.getPointerBitWidth();
+  Type pointerType = rewriter.getIntegerType(pointerBitWidth);
+  Type indexType = rewriter.getIndexType();
+
+  // Access the pointers
+  Type memref1DPointerType = MemRefType::get({-1}, pointerType);
+  unsigned rank = inputType.dyn_cast<RankedTensorType>().getRank();
+  Value c_rank_minus_1 = rewriter.create<arith::ConstantIndexOp>(loc, rank - 1);
+  Value ptrs = rewriter.create<sparse_tensor::ToPointersOp>(
+      loc, memref1DPointerType, inputTensor, c_rank_minus_1);
+
+  // Find length of pointer array
+  Value npointers;
+  if (rank == 1) {
+    npointers = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+  } else {
+    Value dimForPointers;
+    if (hasRowOrdering(inputType)) {
+      dimForPointers = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    } else {
+      dimForPointers = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    }
+    npointers =
+        rewriter.create<tensor::DimOp>(loc, inputTensor, dimForPointers);
+  }
+
+  // The last value from the pointers is the number of nonzero values
+  Value nnz_ptype = rewriter.create<memref::LoadOp>(loc, ptrs, npointers);
+  Value nnz = rewriter.create<arith::IndexCastOp>(loc, nnz_ptype, indexType);
+
+  rewriter.replaceOp(op, nnz);
+  return success();
+};
 
 namespace {
 
@@ -35,101 +173,6 @@ namespace {
 //===----------------------------------------------------------------------===//
 // Passes implementation.
 //===----------------------------------------------------------------------===//
-
-class LowerSizeRewrite : public OpRewritePattern<graphblas::SizeOp> {
-public:
-  using OpRewritePattern<graphblas::SizeOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::SizeOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value inputTensor = op.input();
-    Value size = rewriter.create<tensor::DimOp>(loc, inputTensor, c0);
-
-    rewriter.replaceOp(op, size);
-    return success();
-  };
-};
-
-class LowerNumRowsRewrite : public OpRewritePattern<graphblas::NumRowsOp> {
-public:
-  using OpRewritePattern<graphblas::NumRowsOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::NumRowsOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value inputTensor = op.input();
-    Value nrows = rewriter.create<tensor::DimOp>(loc, inputTensor, c0);
-
-    rewriter.replaceOp(op, nrows);
-    return success();
-  };
-};
-
-class LowerNumColsRewrite : public OpRewritePattern<graphblas::NumColsOp> {
-public:
-  using OpRewritePattern<graphblas::NumColsOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::NumColsOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-
-    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Value inputTensor = op.input();
-    Value ncols = rewriter.create<tensor::DimOp>(loc, inputTensor, c1);
-
-    rewriter.replaceOp(op, ncols);
-    return success();
-  };
-};
-
-class LowerNumValsRewrite : public OpRewritePattern<graphblas::NumValsOp> {
-public:
-  using OpRewritePattern<graphblas::NumValsOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::NumValsOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-    Value inputTensor = op.input();
-    Type inputType = inputTensor.getType();
-
-    sparse_tensor::SparseTensorEncodingAttr sparseEncoding =
-        sparse_tensor::getSparseTensorEncoding(inputType);
-    unsigned pointerBitWidth = sparseEncoding.getPointerBitWidth();
-    Type pointerType = rewriter.getIntegerType(pointerBitWidth);
-    Type indexType = rewriter.getIndexType();
-
-    // Access the pointers
-    Type memref1DPointerType = MemRefType::get({-1}, pointerType);
-    unsigned rank = inputType.dyn_cast<RankedTensorType>().getRank();
-    Value c_rank_minus_1 =
-        rewriter.create<arith::ConstantIndexOp>(loc, rank - 1);
-    Value ptrs = rewriter.create<sparse_tensor::ToPointersOp>(
-        loc, memref1DPointerType, inputTensor, c_rank_minus_1);
-
-    // Find length of pointer array
-    Value npointers;
-    if (rank == 1) {
-      npointers = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    } else {
-      Value dimForPointers;
-      if (hasRowOrdering(inputType)) {
-        dimForPointers = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-      } else {
-        dimForPointers = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-      }
-      npointers =
-          rewriter.create<tensor::DimOp>(loc, inputTensor, dimForPointers);
-    }
-
-    // The last value from the pointers is the number of nonzero values
-    Value nnz_ptype = rewriter.create<memref::LoadOp>(loc, ptrs, npointers);
-    Value nnz = rewriter.create<arith::IndexCastOp>(loc, nnz_ptype, indexType);
-
-    rewriter.replaceOp(op, nnz);
-    return success();
-  };
-};
 
 class LowerDupRewrite : public OpRewritePattern<graphblas::DupOp> {
 public:
@@ -332,8 +375,6 @@ public:
 
     rewriter.replaceOp(op, output);
 
-    cleanupIntermediateTensor(rewriter, module, loc, output);
-
     return success();
   };
 };
@@ -380,14 +421,15 @@ public:
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
 
     // Get the shape as a ValueRange
-    ValueRange shape;
+    SmallVector<Value, 2> shape;
     if (rank == 1) {
       Value size = rewriter.create<graphblas::SizeOp>(loc, input);
-      shape = ValueRange{size};
+      shape.push_back(size);
     } else {
       Value nrows = rewriter.create<graphblas::NumRowsOp>(loc, input);
       Value ncols = rewriter.create<graphblas::NumColsOp>(loc, input);
-      shape = ValueRange{nrows, ncols};
+      shape.push_back(nrows);
+      shape.push_back(ncols);
     }
 
     // Create a new tensor with the correct output value type
@@ -465,55 +507,7 @@ public:
 
     rewriter.replaceOp(op, output);
 
-    cleanupIntermediateTensor(rewriter, module, loc, output);
-
     return success();
-  };
-};
-
-class TransposeDWIMRewrite : public OpRewritePattern<graphblas::TransposeOp> {
-public:
-  using OpRewritePattern<graphblas::TransposeOp>::OpRewritePattern;
-
-  static bool needsDWIM(graphblas::TransposeOp op) {
-
-    Value inputTensor = op.input();
-    RankedTensorType inputType =
-        inputTensor.getType().dyn_cast<RankedTensorType>();
-    RankedTensorType outputType =
-        op->getResultTypes().front().dyn_cast<RankedTensorType>();
-
-    bool inputTypeIsCSR = hasRowOrdering(inputType);
-    bool outputTypeIsCSR = hasRowOrdering(outputType);
-
-    return (inputTypeIsCSR == outputTypeIsCSR);
-  };
-
-  LogicalResult match(graphblas::TransposeOp op) const override {
-    if (needsDWIM(op))
-      return success();
-    else
-      return failure();
-  };
-
-  void rewrite(graphblas::TransposeOp op,
-               PatternRewriter &rewriter) const override {
-    MLIRContext *context = op.getContext();
-    Location loc = op->getLoc();
-
-    Value inputTensor = op.input();
-    RankedTensorType outputType =
-        op->getResultTypes().front().dyn_cast<RankedTensorType>();
-
-    RankedTensorType flippedInputType =
-        getFlippedLayoutType(context, inputTensor.getType());
-
-    Value flippedInput = rewriter.create<graphblas::ConvertLayoutOp>(
-        loc, flippedInputType, inputTensor);
-    Value transposed =
-        rewriter.create<graphblas::TransposeOp>(loc, outputType, flippedInput);
-
-    rewriter.replaceOp(op, transposed);
   };
 };
 
@@ -521,16 +515,8 @@ class LowerTransposeRewrite : public OpRewritePattern<graphblas::TransposeOp> {
 public:
   using OpRewritePattern<graphblas::TransposeOp>::OpRewritePattern;
 
-  LogicalResult match(graphblas::TransposeOp op) const override {
-    if (TransposeDWIMRewrite::needsDWIM(op))
-      return failure();
-    else
-      return success();
-  };
-
-  void rewrite(graphblas::TransposeOp op,
-               PatternRewriter &rewriter) const override {
-
+  LogicalResult matchAndRewrite(graphblas::TransposeOp op,
+                                PatternRewriter &rewriter) const override {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     Location loc = op->getLoc();
 
@@ -561,66 +547,19 @@ public:
     rewriter.replaceOp(op, output);
 
     cleanupIntermediateTensor(rewriter, module, loc, output);
+
+    return success();
   };
 };
 
-class LowerSelectRewrite : public OpRewritePattern<graphblas::SelectOp> {
+class LowerSelectGenericRewrite
+    : public OpRewritePattern<graphblas::SelectGenericOp> {
 public:
-  using OpRewritePattern<graphblas::SelectOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::SelectOp op,
+  using OpRewritePattern<graphblas::SelectGenericOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(graphblas::SelectGenericOp op,
                                 PatternRewriter &rewriter) const override {
-
-    std::string selector = op.selector().str();
-    OperandRange thunks = op.thunks();
-
-    if (selector == "probability") {
-      Value thunk = thunks[0];
-      Value rngContext = thunks[1];
-      auto probBlock = std::bind(probabilityBlock, _1, _2, _3, _4, _5, _6, _7,
-                                 thunk, rngContext);
-      return buildAlgorithm<graphblas::SelectOp>(op, rewriter, probBlock);
-    } else {
-      Location loc = op->getLoc();
-
-      Value input = op.input();
-      RankedTensorType inputType = input.getType().cast<RankedTensorType>();
-      Type valueType = inputType.getElementType();
-
-      // Replace with SelectGenericOp
-      graphblas::SelectGenericOp newSelectOp =
-          rewriter.create<graphblas::SelectGenericOp>(loc, op->getResultTypes(),
-                                                      input, 1);
-
-      // Populate based on operator kind
-      LogicalResult popResult = failure();
-      if (unary1.contains(selector) || unary3.contains(selector)) {
-        popResult = populateUnary(rewriter, loc, selector, valueType,
-                                  newSelectOp.getRegions().slice(0, 1),
-                                  graphblas::YieldKind::SELECT_OUT,
-                                  /* boolAsI8 */ false);
-      } else {
-        popResult = populateBinary(rewriter, loc, selector, valueType,
-                                   newSelectOp.getRegions().slice(0, 1),
-                                   graphblas::YieldKind::SELECT_OUT,
-                                   /* boolAsI8 */ false);
-      }
-      if (failed(popResult))
-        return failure();
-
-      // Remove thunk from populated block
-      if (binary2.contains(selector) || binary4.contains(selector)) {
-        Value thunk = thunks[0];
-        Block &block = newSelectOp.getRegion(0).front();
-        Value thunkArg = block.getArgument(1);
-        thunkArg.replaceAllUsesWith(thunk);
-        block.eraseArgument(1);
-      }
-
-      rewriter.setInsertionPointAfter(newSelectOp);
-      rewriter.replaceOp(op, newSelectOp.getResult());
-    }
-
-    return success();
+    return buildAlgorithm<graphblas::SelectGenericOp>(op, rewriter,
+                                                      genericBlock);
   };
 
   template <class T>
@@ -648,12 +587,17 @@ public:
     // Get sparse tensor info
     unsigned rank = inputType.getRank();
     Value nrow;
-    if (rank == 2)
-      nrow = rewriter.create<graphblas::NumRowsOp>(loc, input);
-    else
+    if (rank == 2) {
+      bool inputTypeIsCSR = hasRowOrdering(inputType);
+      if (inputTypeIsCSR)
+        nrow = rewriter.create<graphblas::NumRowsOp>(loc, input);
+      else
+        nrow = rewriter.create<graphblas::NumColsOp>(loc, input);
+    } else {
       // Vectors are stored as a 1xn matrix
       // so the code works correctly if we assume a single row
       nrow = c1;
+    }
 
     Value indexPos = (rank == 2 ? c1 : c0);
     Value Ap = rewriter.create<sparse_tensor::ToPointersOp>(
@@ -752,43 +696,6 @@ public:
   };
 
 private:
-  static LogicalResult
-  probabilityBlock(graphblas::SelectOp op, PatternRewriter &rewriter,
-                   Location loc, Value &keep, Value val, Value row, Value col,
-                   // These are not part of the standard signature
-                   // and will be passed using `bind`
-                   Value thunk, Value rngContext) {
-    Type f64Type = rewriter.getF64Type();
-    SymbolRefAttr random_double =
-        SymbolRefAttr::get(rewriter.getContext(), "random_double");
-    // Get a random double between [0, 1)
-    CallOp randCall = rewriter.create<mlir::CallOp>(
-        loc, random_double, TypeRange{f64Type}, ArrayRef<Value>({rngContext}));
-    Value rand = randCall.getResult(0);
-    keep = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT, rand,
-                                          thunk);
-
-    return success();
-  };
-};
-
-class LowerSelectGenericRewrite
-    : public OpRewritePattern<graphblas::SelectGenericOp> {
-public:
-  using OpRewritePattern<graphblas::SelectGenericOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::SelectGenericOp op,
-                                PatternRewriter &rewriter) const override {
-    LogicalResult callResult =
-        LowerSelectRewrite::buildAlgorithm<graphblas::SelectGenericOp>(
-            op, rewriter, genericBlock);
-    if (callResult.failed()) {
-      return callResult;
-    }
-
-    return success();
-  };
-
-private:
   static LogicalResult genericBlock(graphblas::SelectGenericOp op,
                                     PatternRewriter &rewriter, Location loc,
                                     Value &keep, Value val, Value row,
@@ -825,83 +732,58 @@ private:
   };
 };
 
-class ReduceToVectorDWIMRewrite
-    : public OpRewritePattern<graphblas::ReduceToVectorOp> {
+class LowerSelectCustomRewrite : public OpRewritePattern<graphblas::SelectOp> {
 public:
-  using OpRewritePattern<graphblas::ReduceToVectorOp>::OpRewritePattern;
+  using OpRewritePattern<graphblas::SelectOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(graphblas::SelectOp op,
+                                PatternRewriter &rewriter) const override {
 
-  static bool needsDWIM(graphblas::ReduceToVectorOp op) {
-    int axis = op.axis();
-    bool isCSR = hasRowOrdering(op.input().getType());
-    return ((axis == 0 && isCSR) || (axis == 1 && !isCSR));
+    std::string selector = op.selector().str();
+    OperandRange thunks = op.thunks();
+
+    if (selector == "probability") {
+      Value thunk = thunks[0];
+      Value rngContext = thunks[1];
+      auto probBlock = std::bind(probabilityBlock, _1, _2, _3, _4, _5, _6, _7,
+                                 thunk, rngContext);
+      return LowerSelectGenericRewrite::buildAlgorithm<graphblas::SelectOp>(
+          op, rewriter, probBlock);
+    }
+
+    return failure();
   };
 
-  LogicalResult matchAndRewrite(graphblas::ReduceToVectorOp op,
-                                PatternRewriter &rewriter) const override {
-    if (!needsDWIM(op))
-      return failure();
-
-    MLIRContext *context = op.getContext();
-    Location loc = op->getLoc();
-
-    Value input = op.input();
-    RankedTensorType flippedInputType =
-        getFlippedLayoutType(context, input.getType());
-
-    rewriter.setInsertionPoint(op);
-    Value flippedInput = rewriter.create<graphblas::ConvertLayoutOp>(
-        loc, flippedInputType, input);
-    op.inputMutable().assign(flippedInput);
+private:
+  static LogicalResult
+  probabilityBlock(graphblas::SelectOp op, PatternRewriter &rewriter,
+                   Location loc, Value &keep, Value val, Value row, Value col,
+                   // These are not part of the standard signature
+                   // and will be passed using `bind`
+                   Value thunk, Value rngContext) {
+    Type f64Type = rewriter.getF64Type();
+    SymbolRefAttr random_double =
+        SymbolRefAttr::get(rewriter.getContext(), "random_double");
+    // Get a random double between [0, 1)
+    CallOp randCall = rewriter.create<mlir::CallOp>(
+        loc, random_double, TypeRange{f64Type}, ArrayRef<Value>({rngContext}));
+    Value rand = randCall.getResult(0);
+    keep = rewriter.create<arith::CmpFOp>(loc, arith::CmpFPredicate::OLT, rand,
+                                          thunk);
 
     return success();
   };
 };
 
-class LowerReduceToVectorRewrite
-    : public OpRewritePattern<graphblas::ReduceToVectorOp> {
+class LowerReduceToVectorGenericRewrite
+    : public OpRewritePattern<graphblas::ReduceToVectorGenericOp> {
 public:
-  using OpRewritePattern<graphblas::ReduceToVectorOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::ReduceToVectorOp op,
+  using OpRewritePattern<graphblas::ReduceToVectorGenericOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(graphblas::ReduceToVectorGenericOp op,
                                 PatternRewriter &rewriter) const override {
-    if (ReduceToVectorDWIMRewrite::needsDWIM(op))
-      return failure();
-
-    Value input = op.input();
-    StringRef aggregator = op.aggregator();
-    RankedTensorType inputType = input.getType().dyn_cast<RankedTensorType>();
-    Type elementType = inputType.getElementType();
-    Type i64Type = rewriter.getI64Type();
-
-    if (aggregator == "count") {
-      return buildAlgorithm<graphblas::ReduceToVectorOp>(op, rewriter, i64Type,
-                                                         countBlock);
-    } else if (aggregator == "argmin" or aggregator == "argmax") {
-      return buildAlgorithm<graphblas::ReduceToVectorOp>(op, rewriter, i64Type,
-                                                         argminmaxBlock);
-    } else if (aggregator == "first" or aggregator == "last") {
-      return buildAlgorithm<graphblas::ReduceToVectorOp>(
-          op, rewriter, elementType, firstLastBlock);
-    } else {
-      Location loc = op->getLoc();
-
-      NamedAttrList attributes = {};
-      attributes.append(StringRef("axis"),
-                        rewriter.getIntegerAttr(i64Type, op.axis()));
-      attributes.append(StringRef("mask_complement"),
-                        rewriter.getBoolAttr(op.mask_complement()));
-      graphblas::ReduceToVectorGenericOp newReduceOp =
-          rewriter.create<graphblas::ReduceToVectorGenericOp>(
-              loc, op->getResultTypes(), input, attributes.getAttrs(), 2);
-
-      if (failed(populateMonoid(rewriter, loc, op.aggregator(), elementType,
-                                newReduceOp.getRegions().slice(0, 2),
-                                graphblas::YieldKind::AGG_IDENTITY,
-                                graphblas::YieldKind::AGG)))
-        return failure();
-
-      rewriter.setInsertionPointAfter(newReduceOp);
-      rewriter.replaceOp(op, newReduceOp.getResult());
-    }
+    Type elementType =
+        op.input().getType().cast<RankedTensorType>().getElementType();
+    return buildAlgorithm<graphblas::ReduceToVectorGenericOp>(
+        op, rewriter, elementType, genericBlock);
 
     return success();
   };
@@ -1032,6 +914,91 @@ public:
   };
 
 private:
+  static LogicalResult genericBlock(graphblas::ReduceToVectorGenericOp op,
+                                    PatternRewriter &rewriter, Location loc,
+                                    Value &aggVal, Value ptr, Value nextPtr,
+                                    Value Ii, Value Ix) {
+    // Required blocks
+    RegionRange extensions = op.extensions();
+    ExtensionBlocks extBlocks;
+    std::set<graphblas::YieldKind> required = {
+        graphblas::YieldKind::AGG_IDENTITY, graphblas::YieldKind::AGG};
+    LogicalResult extractResult =
+        extBlocks.extractBlocks(op, extensions, required, {});
+
+    if (extractResult.failed()) {
+      return extractResult;
+    }
+
+    // Build inner block
+    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+    // insert agg identity
+    rewriter.mergeBlocks(extBlocks.aggIdentity, rewriter.getBlock(), {});
+    graphblas::YieldOp aggIdentityYield =
+        llvm::dyn_cast_or_null<graphblas::YieldOp>(
+            rewriter.getBlock()->getTerminator());
+    Value c0Accumulator = aggIdentityYield.values().front();
+    rewriter.eraseOp(aggIdentityYield);
+
+    // reduce in a loop
+    scf::ParallelOp aggLoop =
+        rewriter.create<scf::ParallelOp>(loc, ptr, nextPtr, c1, c0Accumulator);
+    ValueRange aggIdx = aggLoop.getInductionVars();
+
+    rewriter.setInsertionPointToStart(aggLoop.getBody());
+    Value x = rewriter.create<memref::LoadOp>(loc, Ix, aggIdx);
+
+    scf::ReduceOp reducer = rewriter.create<scf::ReduceOp>(loc, x);
+    BlockArgument lhs = reducer.getRegion().getArgument(0);
+    BlockArgument rhs = reducer.getRegion().getArgument(1);
+
+    rewriter.setInsertionPointToStart(&reducer.getRegion().front());
+
+    rewriter.mergeBlocks(extBlocks.agg, rewriter.getBlock(), {lhs, rhs});
+    graphblas::YieldOp aggYield = llvm::dyn_cast_or_null<graphblas::YieldOp>(
+        rewriter.getBlock()->getTerminator());
+    Value result = aggYield.values().front();
+    rewriter.eraseOp(aggYield);
+
+    rewriter.create<scf::ReduceReturnOp>(loc, result);
+
+    rewriter.setInsertionPointAfter(aggLoop);
+
+    aggVal = aggLoop.getResult(0);
+
+    return success();
+  };
+};
+
+class LowerReduceToVectorCustomRewrite
+    : public OpRewritePattern<graphblas::ReduceToVectorOp> {
+public:
+  using OpRewritePattern<graphblas::ReduceToVectorOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(graphblas::ReduceToVectorOp op,
+                                PatternRewriter &rewriter) const override {
+    Value input = op.input();
+    StringRef aggregator = op.aggregator();
+    RankedTensorType inputType = input.getType().dyn_cast<RankedTensorType>();
+    Type elementType = inputType.getElementType();
+    Type i64Type = rewriter.getI64Type();
+
+    if (aggregator == "count") {
+      return LowerReduceToVectorGenericRewrite::buildAlgorithm<
+          graphblas::ReduceToVectorOp>(op, rewriter, i64Type, countBlock);
+    } else if (aggregator == "argmin" or aggregator == "argmax") {
+      return LowerReduceToVectorGenericRewrite::buildAlgorithm<
+          graphblas::ReduceToVectorOp>(op, rewriter, i64Type, argminmaxBlock);
+    } else if (aggregator == "first" or aggregator == "last") {
+      return LowerReduceToVectorGenericRewrite::buildAlgorithm<
+          graphblas::ReduceToVectorOp>(op, rewriter, elementType,
+                                       firstLastBlock);
+    }
+
+    return failure();
+  };
+
+private:
   static LogicalResult countBlock(graphblas::ReduceToVectorOp op,
                                   PatternRewriter &rewriter, Location loc,
                                   Value &aggVal, Value ptr, Value nextPtr,
@@ -1123,215 +1090,6 @@ private:
   }
 };
 
-class LowerReduceToVectorGenericRewrite
-    : public OpRewritePattern<graphblas::ReduceToVectorGenericOp> {
-public:
-  using OpRewritePattern<graphblas::ReduceToVectorGenericOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::ReduceToVectorGenericOp op,
-                                PatternRewriter &rewriter) const override {
-    Type elementType =
-        op.input().getType().cast<RankedTensorType>().getElementType();
-    LogicalResult callResult = LowerReduceToVectorRewrite::buildAlgorithm<
-        graphblas::ReduceToVectorGenericOp>(op, rewriter, elementType,
-                                            genericBlock);
-    if (callResult.failed()) {
-      return callResult;
-    }
-
-    return success();
-  };
-
-private:
-  static LogicalResult genericBlock(graphblas::ReduceToVectorGenericOp op,
-                                    PatternRewriter &rewriter, Location loc,
-                                    Value &aggVal, Value ptr, Value nextPtr,
-                                    Value Ii, Value Ix) {
-    // Required blocks
-    RegionRange extensions = op.extensions();
-    ExtensionBlocks extBlocks;
-    std::set<graphblas::YieldKind> required = {
-        graphblas::YieldKind::AGG_IDENTITY, graphblas::YieldKind::AGG};
-    LogicalResult extractResult =
-        extBlocks.extractBlocks(op, extensions, required, {});
-
-    if (extractResult.failed()) {
-      return extractResult;
-    }
-
-    // Build inner block
-    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-
-    // insert agg identity
-    rewriter.mergeBlocks(extBlocks.aggIdentity, rewriter.getBlock(), {});
-    graphblas::YieldOp aggIdentityYield =
-        llvm::dyn_cast_or_null<graphblas::YieldOp>(
-            rewriter.getBlock()->getTerminator());
-    Value c0Accumulator = aggIdentityYield.values().front();
-    rewriter.eraseOp(aggIdentityYield);
-
-    // reduce in a loop
-    scf::ParallelOp aggLoop =
-        rewriter.create<scf::ParallelOp>(loc, ptr, nextPtr, c1, c0Accumulator);
-    ValueRange aggIdx = aggLoop.getInductionVars();
-
-    rewriter.setInsertionPointToStart(aggLoop.getBody());
-    Value x = rewriter.create<memref::LoadOp>(loc, Ix, aggIdx);
-
-    scf::ReduceOp reducer = rewriter.create<scf::ReduceOp>(loc, x);
-    BlockArgument lhs = reducer.getRegion().getArgument(0);
-    BlockArgument rhs = reducer.getRegion().getArgument(1);
-
-    rewriter.setInsertionPointToStart(&reducer.getRegion().front());
-
-    rewriter.mergeBlocks(extBlocks.agg, rewriter.getBlock(), {lhs, rhs});
-    graphblas::YieldOp aggYield = llvm::dyn_cast_or_null<graphblas::YieldOp>(
-        rewriter.getBlock()->getTerminator());
-    Value result = aggYield.values().front();
-    rewriter.eraseOp(aggYield);
-
-    rewriter.create<scf::ReduceReturnOp>(loc, result);
-
-    rewriter.setInsertionPointAfter(aggLoop);
-
-    aggVal = aggLoop.getResult(0);
-
-    return success();
-  };
-};
-
-class LowerReduceToScalarRewrite
-    : public OpRewritePattern<graphblas::ReduceToScalarOp> {
-public:
-  using OpRewritePattern<graphblas::ReduceToScalarOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::ReduceToScalarOp op,
-                                PatternRewriter &rewriter) const override {
-    StringRef aggregator = op.aggregator();
-
-    if (aggregator == "count") {
-      return rewriteCount(op, rewriter);
-    } else if (aggregator == "argmin" or aggregator == "argmax") {
-      return rewriteArgMinMax(op, rewriter);
-    } else {
-      return rewriteStandard(op, rewriter);
-    }
-  };
-
-private:
-  LogicalResult rewriteCount(graphblas::ReduceToScalarOp op,
-                             PatternRewriter &rewriter) const {
-    Value input = op.input();
-    Location loc = op->getLoc();
-    Type int64Type = rewriter.getIntegerType(64);
-
-    Value countOp = rewriter.create<graphblas::NumValsOp>(loc, input);
-    Value countOp_64 =
-        rewriter.create<arith::IndexCastOp>(loc, countOp, int64Type);
-    rewriter.replaceOp(op, countOp_64);
-
-    return success();
-  }
-
-  LogicalResult rewriteArgMinMax(graphblas::ReduceToScalarOp op,
-                                 PatternRewriter &rewriter) const {
-    // TODO we get seg faults if given a size 0 vector or a sparse vector with
-    // no non-zero values. Probably should return a -1 for these cases.
-    Location loc = op->getLoc();
-    StringRef aggregator = op.aggregator();
-
-    Value input = op.input();
-    RankedTensorType inputType = input.getType().cast<RankedTensorType>();
-
-    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    Type indexType = rewriter.getIndexType();
-    Type int64Type = rewriter.getIntegerType(64);
-    Type memref1DI64Type = MemRefType::get({-1}, int64Type);
-
-    Value pointers = rewriter.create<sparse_tensor::ToPointersOp>(
-        loc, memref1DI64Type, input, c0);
-    Value endPosition64 = rewriter.create<memref::LoadOp>(loc, pointers, c1);
-    Value endPosition =
-        rewriter.create<arith::IndexCastOp>(loc, endPosition64, indexType);
-
-    Type inputElementType = inputType.getElementType();
-    Type memref1DValueType = MemRefType::get({-1}, inputElementType);
-    Value values = rewriter.create<sparse_tensor::ToValuesOp>(
-        loc, memref1DValueType, input);
-
-    Value initialExtremum = rewriter.create<memref::LoadOp>(loc, values, c0);
-
-    scf::ForOp loop = rewriter.create<scf::ForOp>(
-        loc, c1, endPosition, c1, ValueRange{initialExtremum, c0});
-    Value currentValuePosition = loop.getInductionVar();
-    Value currentExtremum = loop.getLoopBody().getArgument(1);
-    Value currentExtremumPosition = loop.getLoopBody().getArgument(2);
-    rewriter.setInsertionPointToStart(loop.getBody());
-
-    Value currentValue =
-        rewriter.create<memref::LoadOp>(loc, values, currentValuePosition);
-    bool useMinimum = aggregator == "argmin";
-    Value replace = llvm::TypeSwitch<Type, Value>(inputElementType)
-                        .Case<IntegerType>([&](IntegerType type) {
-                          return rewriter.create<arith::CmpIOp>(
-                              loc,
-                              useMinimum ? arith::CmpIPredicate::slt
-                                         : arith::CmpIPredicate::sgt,
-                              currentValue, currentExtremum);
-                        })
-                        .Case<FloatType>([&](FloatType type) {
-                          return rewriter.create<arith::CmpFOp>(
-                              loc,
-                              useMinimum ? arith::CmpFPredicate::OLT
-                                         : arith::CmpFPredicate::OGT,
-                              currentValue, currentExtremum);
-                        });
-
-    scf::IfOp ifBlock = rewriter.create<scf::IfOp>(
-        loc, TypeRange{inputElementType, indexType}, replace, true);
-    rewriter.setInsertionPointToStart(ifBlock.thenBlock());
-    rewriter.create<scf::YieldOp>(
-        loc, ValueRange{currentValue, currentValuePosition});
-    rewriter.setInsertionPointToStart(ifBlock.elseBlock());
-    rewriter.create<scf::YieldOp>(
-        loc, ValueRange{currentExtremum, currentExtremumPosition});
-    rewriter.setInsertionPointAfter(ifBlock);
-
-    rewriter.create<scf::YieldOp>(loc, ifBlock.getResults());
-    rewriter.setInsertionPointAfter(loop);
-
-    Value finalExtremumPosition = loop.getResult(1);
-    Value indices = rewriter.create<sparse_tensor::ToIndicesOp>(
-        loc, memref1DI64Type, input, c0);
-    Value argExtremum =
-        rewriter.create<memref::LoadOp>(loc, indices, finalExtremumPosition);
-    rewriter.replaceOp(op, argExtremum);
-
-    return success();
-  }
-
-  LogicalResult rewriteStandard(graphblas::ReduceToScalarOp op,
-                                PatternRewriter &rewriter) const {
-    Value input = op.input();
-    Location loc = op->getLoc();
-    Type valueType = input.getType().cast<RankedTensorType>().getElementType();
-
-    graphblas::ReduceToScalarGenericOp newReduceOp =
-        rewriter.create<graphblas::ReduceToScalarGenericOp>(
-            loc, op->getResultTypes(), input, 2);
-
-    if (failed(populateMonoid(rewriter, loc, op.aggregator(), valueType,
-                              newReduceOp.getRegions().slice(0, 2),
-                              graphblas::YieldKind::AGG_IDENTITY,
-                              graphblas::YieldKind::AGG)))
-      return failure();
-
-    rewriter.setInsertionPointAfter(newReduceOp);
-    rewriter.replaceOp(op, newReduceOp.getResult());
-
-    return success();
-  }
-};
-
 class LowerReduceToScalarGenericRewrite
     : public OpRewritePattern<graphblas::ReduceToScalarGenericOp> {
 public:
@@ -1409,60 +1167,87 @@ public:
   };
 };
 
-class LowerApplyRewrite : public OpRewritePattern<graphblas::ApplyOp> {
+class LowerReduceToScalarCustomRewrite
+    : public OpRewritePattern<graphblas::ReduceToScalarOp> {
 public:
-  using OpRewritePattern<graphblas::ApplyOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::ApplyOp op,
+  using OpRewritePattern<graphblas::ReduceToScalarOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(graphblas::ReduceToScalarOp op,
                                 PatternRewriter &rewriter) const override {
-    Value input, thunk;
-    LogicalResult extractArgResult = extractApplyOpArgs(op, input, thunk);
-    assert(!extractArgResult.failed() &&
-           "Assumption that extractApplyOpArgs succeeded (due to verify "
-           "method) has been violated.");
-
-    StringRef apply_operator = op.apply_operator();
-    if (apply_operator == "identity") {
-      // This doesn't produce a copy like we do for all the other operators
-      rewriter.replaceOp(op, input);
-      return success();
-    }
-
-    ModuleOp module = op->getParentOfType<ModuleOp>(); /* ignore unused variable
-                                                          for debugging */
-    (void)module;
+    StringRef aggregator = op.aggregator();
     Location loc = op->getLoc();
 
-    Type valueType =
-        input.getType().dyn_cast<RankedTensorType>().getElementType();
-
-    // New op
-    graphblas::ApplyGenericOp newApplyOp =
-        rewriter.create<graphblas::ApplyGenericOp>(loc, op->getResultTypes(),
-                                                   input, 1);
-
-    // Populate based on operator kind
-    LogicalResult popResult = failure();
-    if (unary1.contains(apply_operator) || unary3.contains(apply_operator))
-      popResult = populateUnary(rewriter, loc, apply_operator, valueType,
-                                newApplyOp.getRegions().slice(0, 1),
-                                graphblas::YieldKind::TRANSFORM_OUT);
-    else
-      popResult = populateBinary(rewriter, loc, apply_operator, valueType,
-                                 newApplyOp.getRegions().slice(0, 1),
-                                 graphblas::YieldKind::TRANSFORM_OUT);
-    if (failed(popResult))
+    if (aggregator != "argmin" && aggregator != "argmax")
       return failure();
 
-    // Remove thunk from populated block
-    if (binary2.contains(apply_operator) || binary4.contains(apply_operator)) {
-      Block &block = newApplyOp.getRegion(0).front();
-      int thunkPos = thunk == op.left() ? 0 : 1;
-      Value thunkArg = block.getArgument(thunkPos);
-      thunkArg.replaceAllUsesWith(thunk);
-      block.eraseArgument(thunkPos);
-    }
+    // TODO we get seg faults if given a size 0 vector or a sparse vector with
+    // no non-zero values. Probably should return a -1 for these cases.
+    Value input = op.input();
+    RankedTensorType inputType = input.getType().cast<RankedTensorType>();
 
-    rewriter.replaceOp(op, newApplyOp.getResult());
+    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Type indexType = rewriter.getIndexType();
+    Type int64Type = rewriter.getIntegerType(64);
+    Type memref1DI64Type = MemRefType::get({-1}, int64Type);
+
+    Value pointers = rewriter.create<sparse_tensor::ToPointersOp>(
+        loc, memref1DI64Type, input, c0);
+    Value endPosition64 = rewriter.create<memref::LoadOp>(loc, pointers, c1);
+    Value endPosition =
+        rewriter.create<arith::IndexCastOp>(loc, endPosition64, indexType);
+
+    Type inputElementType = inputType.getElementType();
+    Type memref1DValueType = MemRefType::get({-1}, inputElementType);
+    Value values = rewriter.create<sparse_tensor::ToValuesOp>(
+        loc, memref1DValueType, input);
+
+    Value initialExtremum = rewriter.create<memref::LoadOp>(loc, values, c0);
+
+    scf::ForOp loop = rewriter.create<scf::ForOp>(
+        loc, c1, endPosition, c1, ValueRange{initialExtremum, c0});
+    Value currentValuePosition = loop.getInductionVar();
+    Value currentExtremum = loop.getLoopBody().getArgument(1);
+    Value currentExtremumPosition = loop.getLoopBody().getArgument(2);
+    rewriter.setInsertionPointToStart(loop.getBody());
+
+    Value currentValue =
+        rewriter.create<memref::LoadOp>(loc, values, currentValuePosition);
+    bool useMinimum = aggregator == "argmin";
+    Value replace = llvm::TypeSwitch<Type, Value>(inputElementType)
+                        .Case<IntegerType>([&](IntegerType type) {
+                          return rewriter.create<arith::CmpIOp>(
+                              loc,
+                              useMinimum ? arith::CmpIPredicate::slt
+                                         : arith::CmpIPredicate::sgt,
+                              currentValue, currentExtremum);
+                        })
+                        .Case<FloatType>([&](FloatType type) {
+                          return rewriter.create<arith::CmpFOp>(
+                              loc,
+                              useMinimum ? arith::CmpFPredicate::OLT
+                                         : arith::CmpFPredicate::OGT,
+                              currentValue, currentExtremum);
+                        });
+
+    scf::IfOp ifBlock = rewriter.create<scf::IfOp>(
+        loc, TypeRange{inputElementType, indexType}, replace, true);
+    rewriter.setInsertionPointToStart(ifBlock.thenBlock());
+    rewriter.create<scf::YieldOp>(
+        loc, ValueRange{currentValue, currentValuePosition});
+    rewriter.setInsertionPointToStart(ifBlock.elseBlock());
+    rewriter.create<scf::YieldOp>(
+        loc, ValueRange{currentExtremum, currentExtremumPosition});
+    rewriter.setInsertionPointAfter(ifBlock);
+
+    rewriter.create<scf::YieldOp>(loc, ifBlock.getResults());
+    rewriter.setInsertionPointAfter(loop);
+
+    Value finalExtremumPosition = loop.getResult(1);
+    Value indices = rewriter.create<sparse_tensor::ToIndicesOp>(
+        loc, memref1DI64Type, input, c0);
+    Value argExtremum =
+        rewriter.create<memref::LoadOp>(loc, indices, finalExtremumPosition);
+    rewriter.replaceOp(op, argExtremum);
 
     return success();
   };
@@ -1483,6 +1268,8 @@ public:
     RankedTensorType outputTensorType =
         op.getResult().getType().cast<RankedTensorType>();
     unsigned rank = inputTensorType.getRank();
+
+    bool inPlace = op.in_place();
 
     Type indexType = rewriter.getIndexType();
     Type memrefPointerType = getMemrefPointerType(inputTensorType);
@@ -1507,10 +1294,18 @@ public:
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
 
     // Build output with same shape as input, but possibly different output type
-    Value output = rewriter.create<graphblas::DupOp>(loc, inputTensor);
-    if (inputTensorType != outputTensorType)
-      output =
-          rewriter.create<graphblas::CastOp>(loc, outputTensorType, output);
+    Value output;
+    if (inPlace) {
+      output = inputTensor;
+    } else {
+      if (inputTensorType != outputTensorType) {
+        // This will create a copy to avoid modifying inputTensor
+        output = rewriter.create<graphblas::CastOp>(loc, outputTensorType,
+                                                    inputTensor);
+      } else {
+        output = rewriter.create<graphblas::DupOp>(loc, inputTensor);
+      }
+    }
     // Get sparse tensor info
     Value inputValues = rewriter.create<sparse_tensor::ToValuesOp>(
         loc, memrefIValueType, inputTensor);
@@ -1526,9 +1321,9 @@ public:
       // - vector -> passes in (val, index, index)
       // - CSR or CSC -> passes in (val, row, col)
       Value inputPointers = rewriter.create<sparse_tensor::ToPointersOp>(
-          loc, memrefPointerType, inputTensor);
+          loc, memrefPointerType, inputTensor, c1);
       Value inputIndices = rewriter.create<sparse_tensor::ToIndicesOp>(
-          loc, memrefIndexType, inputTensor);
+          loc, memrefIndexType, inputTensor, c1);
       bool byCols = false;
       Value npointers;
       if (rank == 1) {
@@ -1565,21 +1360,29 @@ public:
         Value col = rewriter.create<arith::IndexCastOp>(loc, col_64, indexType);
         Value val = rewriter.create<memref::LoadOp>(loc, inputValues, jj);
 
+        // scf::ForOp automatically gets an empty scf.yield at the end which
+        // we need to insert before
+        Operation *scfYield = innerLoop.getBody()->getTerminator();
+
         // insert transformOut block
         graphblas::YieldOp transformOutYield =
             llvm::dyn_cast_or_null<graphblas::YieldOp>(
                 extBlocks.transformOut->getTerminator());
 
-        ValueRange subVals;
-        if (rank == 1)
-          subVals = ValueRange{val, col, col};
-        else if (byCols)
-          subVals = ValueRange{val, col, pointerIdx};
-        else
-          subVals = ValueRange{val, pointerIdx, col};
+        SmallVector<Value, 3> subVals;
+        subVals.push_back(val);
+        if (rank == 1) {
+          subVals.push_back(col);
+          subVals.push_back(col);
+        } else if (byCols) {
+          subVals.push_back(col);
+          subVals.push_back(pointerIdx);
+        } else {
+          subVals.push_back(pointerIdx);
+          subVals.push_back(col);
+        }
 
-        rewriter.mergeBlocks(extBlocks.transformOut, rewriter.getBlock(),
-                             subVals);
+        rewriter.mergeBlockBefore(extBlocks.transformOut, scfYield, subVals);
         Value result = transformOutYield.values().front();
         rewriter.eraseOp(transformOutYield);
 
@@ -1622,143 +1425,8 @@ public:
     // Add return op
     rewriter.replaceOp(op, output);
 
-    cleanupIntermediateTensor(rewriter, module, loc, output);
-
-    return success();
-  };
-};
-
-class LowerMatrixMultiplyRewrite
-    : public OpRewritePattern<graphblas::MatrixMultiplyOp> {
-public:
-  using OpRewritePattern<graphblas::MatrixMultiplyOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::MatrixMultiplyOp op,
-                                PatternRewriter &rewriter) const override {
-    ModuleOp module = op->getParentOfType<ModuleOp>(); /* ignore unused variable
-                                                          for debugging */
-    (void)module;
-    Location loc = op->getLoc();
-
-    // Inputs
-    ValueRange operands = op.getOperands();
-    StringRef semiring = op.semiring();
-    bool maskComplement = op.mask_complement();
-
-    // Types
-    // Can't use result here because it might be a scalar (vector-vector)
-    Type valueType =
-        op.a().getType().dyn_cast<RankedTensorType>().getElementType();
-
-    // New op
-    NamedAttrList attributes = {};
-    attributes.append(StringRef("mask_complement"),
-                      rewriter.getBoolAttr(maskComplement));
-    graphblas::MatrixMultiplyGenericOp newMultOp =
-        rewriter.create<graphblas::MatrixMultiplyGenericOp>(
-            loc, op->getResultTypes(), operands, attributes.getAttrs(), 3);
-
-    if (failed(populateSemiring(rewriter, loc, semiring, valueType,
-                                newMultOp.getRegions().slice(0, 3))))
-      return failure();
-
-    rewriter.setInsertionPointAfter(newMultOp);
-
-    rewriter.replaceOp(op, newMultOp.getResult());
-
-    return success();
-  };
-};
-
-class MatrixMultiplyGenericDWIMFirstArgRewrite
-    : public OpRewritePattern<graphblas::MatrixMultiplyGenericOp> {
-public:
-  using OpRewritePattern<graphblas::MatrixMultiplyGenericOp>::OpRewritePattern;
-
-  template <class T>
-  static bool needsDWIM(T op) {
-    return hasColumnOrdering(op.a().getType());
-  };
-
-  LogicalResult matchAndRewrite(graphblas::MatrixMultiplyGenericOp op,
-                                PatternRewriter &rewriter) const override {
-    if (!needsDWIM(op))
-      return failure();
-
-    MLIRContext *context = op.getContext();
-    Location loc = op->getLoc();
-    Value A = op.a();
-    RankedTensorType aType = A.getType().cast<RankedTensorType>();
-    RankedTensorType flippedMatrixType = getFlippedLayoutType(context, aType);
-
-    rewriter.setInsertionPoint(op);
-    Value flippedA =
-        rewriter.create<graphblas::ConvertLayoutOp>(loc, flippedMatrixType, A);
-    op.aMutable().assign(flippedA);
-
-    return success();
-  };
-};
-
-class MatrixMultiplyGenericDWIMSecondArgRewrite
-    : public OpRewritePattern<graphblas::MatrixMultiplyGenericOp> {
-public:
-  using OpRewritePattern<graphblas::MatrixMultiplyGenericOp>::OpRewritePattern;
-
-  template <class T>
-  static bool needsDWIM(T op) {
-    return hasRowOrdering(op.b().getType());
-  };
-
-  LogicalResult matchAndRewrite(graphblas::MatrixMultiplyGenericOp op,
-                                PatternRewriter &rewriter) const override {
-    if (!needsDWIM(op))
-      return failure();
-
-    MLIRContext *context = op.getContext();
-    Location loc = op->getLoc();
-    Value B = op.b();
-    RankedTensorType bType = B.getType().cast<RankedTensorType>();
-    RankedTensorType flippedMatrixType = getFlippedLayoutType(context, bType);
-
-    rewriter.setInsertionPoint(op);
-    Value flippedB =
-        rewriter.create<graphblas::ConvertLayoutOp>(loc, flippedMatrixType, B);
-    op.bMutable().assign(flippedB);
-
-    return success();
-  };
-};
-
-class MatrixMultiplyGenericDWIMMaskRewrite
-    : public OpRewritePattern<graphblas::MatrixMultiplyGenericOp> {
-public:
-  using OpRewritePattern<graphblas::MatrixMultiplyGenericOp>::OpRewritePattern;
-
-  template <class T>
-  static bool needsDWIM(T op) {
-    Value mask = op.mask();
-    if (!mask)
-      return false;
-    return hasColumnOrdering(mask.getType());
-  };
-
-  LogicalResult matchAndRewrite(graphblas::MatrixMultiplyGenericOp op,
-                                PatternRewriter &rewriter) const override {
-    if (!needsDWIM(op))
-      return failure();
-
-    MLIRContext *context = op.getContext();
-    Location loc = op->getLoc();
-
-    Value mask = op.mask();
-    RankedTensorType maskType = mask.getType().cast<RankedTensorType>();
-    RankedTensorType flippedMatrixType =
-        getFlippedLayoutType(context, maskType);
-
-    rewriter.setInsertionPoint(op);
-    Value flippedMask = rewriter.create<graphblas::ConvertLayoutOp>(
-        loc, flippedMatrixType, mask);
-    op.maskMutable().assign(flippedMask);
+    if (!inPlace)
+      cleanupIntermediateTensor(rewriter, module, loc, output);
 
     return success();
   };
@@ -1770,11 +1438,6 @@ public:
   using OpRewritePattern<graphblas::MatrixMultiplyGenericOp>::OpRewritePattern;
   LogicalResult matchAndRewrite(graphblas::MatrixMultiplyGenericOp op,
                                 PatternRewriter &rewriter) const override {
-    if (MatrixMultiplyGenericDWIMFirstArgRewrite::needsDWIM(op) ||
-        MatrixMultiplyGenericDWIMSecondArgRewrite::needsDWIM(op) ||
-        MatrixMultiplyGenericDWIMMaskRewrite::needsDWIM(op))
-      return failure();
-
     // Required blocks
     RegionRange extensions = op.extensions();
     ExtensionBlocks extBlocks;
@@ -2413,92 +2076,6 @@ private:
   }
 };
 
-class MatrixMultiplyReduceToScalarGenericDWIMFirstArgRewrite
-    : public OpRewritePattern<
-          graphblas::MatrixMultiplyReduceToScalarGenericOp> {
-public:
-  using OpRewritePattern<
-      graphblas::MatrixMultiplyReduceToScalarGenericOp>::OpRewritePattern;
-
-  LogicalResult
-  matchAndRewrite(graphblas::MatrixMultiplyReduceToScalarGenericOp op,
-                  PatternRewriter &rewriter) const override {
-    if (!MatrixMultiplyGenericDWIMFirstArgRewrite::needsDWIM(op))
-      return failure();
-
-    MLIRContext *context = op.getContext();
-    Location loc = op->getLoc();
-    Value A = op.a();
-    RankedTensorType aType = A.getType().cast<RankedTensorType>();
-    RankedTensorType flippedMatrixType = getFlippedLayoutType(context, aType);
-
-    rewriter.setInsertionPoint(op);
-    Value flippedA =
-        rewriter.create<graphblas::ConvertLayoutOp>(loc, flippedMatrixType, A);
-    op.aMutable().assign(flippedA);
-
-    return success();
-  };
-};
-
-class MatrixMultiplyReduceToScalarGenericDWIMSecondArgRewrite
-    : public OpRewritePattern<
-          graphblas::MatrixMultiplyReduceToScalarGenericOp> {
-public:
-  using OpRewritePattern<
-      graphblas::MatrixMultiplyReduceToScalarGenericOp>::OpRewritePattern;
-
-  LogicalResult
-  matchAndRewrite(graphblas::MatrixMultiplyReduceToScalarGenericOp op,
-                  PatternRewriter &rewriter) const override {
-    if (!MatrixMultiplyGenericDWIMSecondArgRewrite::needsDWIM(op))
-      return failure();
-
-    MLIRContext *context = op.getContext();
-    Location loc = op->getLoc();
-    Value B = op.b();
-    RankedTensorType bType = B.getType().cast<RankedTensorType>();
-    RankedTensorType flippedMatrixType = getFlippedLayoutType(context, bType);
-
-    rewriter.setInsertionPoint(op);
-    Value flippedB =
-        rewriter.create<graphblas::ConvertLayoutOp>(loc, flippedMatrixType, B);
-    op.bMutable().assign(flippedB);
-
-    return success();
-  };
-};
-
-class MatrixMultiplyReduceToScalarGenericDWIMMaskRewrite
-    : public OpRewritePattern<
-          graphblas::MatrixMultiplyReduceToScalarGenericOp> {
-public:
-  using OpRewritePattern<
-      graphblas::MatrixMultiplyReduceToScalarGenericOp>::OpRewritePattern;
-
-  LogicalResult
-  matchAndRewrite(graphblas::MatrixMultiplyReduceToScalarGenericOp op,
-                  PatternRewriter &rewriter) const override {
-    if (!MatrixMultiplyGenericDWIMMaskRewrite::needsDWIM(op))
-      return failure();
-
-    MLIRContext *context = op.getContext();
-    Location loc = op->getLoc();
-
-    Value mask = op.mask();
-    RankedTensorType maskType = mask.getType().cast<RankedTensorType>();
-    RankedTensorType flippedMatrixType =
-        getFlippedLayoutType(context, maskType);
-
-    rewriter.setInsertionPoint(op);
-    Value flippedMask = rewriter.create<graphblas::ConvertLayoutOp>(
-        loc, flippedMatrixType, mask);
-    op.maskMutable().assign(flippedMask);
-
-    return success();
-  };
-};
-
 class LowerMatrixMultiplyReduceToScalarGenericRewrite
     : public OpRewritePattern<
           graphblas::MatrixMultiplyReduceToScalarGenericOp> {
@@ -2508,11 +2085,6 @@ public:
   LogicalResult
   matchAndRewrite(graphblas::MatrixMultiplyReduceToScalarGenericOp op,
                   PatternRewriter &rewriter) const override {
-    if (MatrixMultiplyGenericDWIMFirstArgRewrite::needsDWIM(op) ||
-        MatrixMultiplyGenericDWIMSecondArgRewrite::needsDWIM(op) ||
-        MatrixMultiplyGenericDWIMMaskRewrite::needsDWIM(op))
-      return failure();
-
     ModuleOp module = op->getParentOfType<ModuleOp>(); /* ignore unused variable
                                                           for debugging */
     (void)module;
@@ -2786,48 +2358,6 @@ public:
   };
 };
 
-class LowerUnionRewrite : public OpRewritePattern<graphblas::UnionOp> {
-public:
-  using OpRewritePattern<graphblas::UnionOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::UnionOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-
-    Value a = op.a();
-    Value b = op.b();
-    Value mask = op.mask();
-    Type valueType = a.getType().cast<RankedTensorType>().getElementType();
-
-    if (mask) {
-      NamedAttrList attributes = {};
-      attributes.append(StringRef("mask_complement"),
-                        rewriter.getBoolAttr(op.mask_complement()));
-      a = rewriter.create<graphblas::SelectMaskOp>(
-          loc, a.getType(), ValueRange{a, mask}, attributes.getAttrs());
-      b = rewriter.create<graphblas::SelectMaskOp>(
-          loc, b.getType(), ValueRange{b, mask}, attributes.getAttrs());
-    }
-
-    // New op
-    NamedAttrList attributes = {};
-    graphblas::UnionGenericOp newUnionOp =
-        rewriter.create<graphblas::UnionGenericOp>(loc, op->getResultTypes(),
-                                                   ValueRange{a, b},
-                                                   attributes.getAttrs(), 1);
-
-    if (failed(populateBinary(rewriter, loc, op.union_operator(), valueType,
-                              newUnionOp.getRegions().slice(0, 1),
-                              graphblas::YieldKind::MULT)))
-      return failure();
-
-    rewriter.setInsertionPointAfter(newUnionOp);
-
-    rewriter.replaceOp(op, newUnionOp.getResult());
-
-    return success();
-  };
-};
-
 class LowerUnionGenericRewrite
     : public OpRewritePattern<graphblas::UnionGenericOp> {
 public:
@@ -2876,61 +2406,6 @@ public:
   };
 };
 
-class LowerIntersectRewrite : public OpRewritePattern<graphblas::IntersectOp> {
-public:
-  using OpRewritePattern<graphblas::IntersectOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::IntersectOp op,
-                                PatternRewriter &rewriter) const override {
-    Location loc = op->getLoc();
-    Value a = op.a();
-    Value b = op.b();
-    Value mask = op.mask();
-    Type valueType = a.getType().cast<RankedTensorType>().getElementType();
-    StringRef opstr = op.intersect_operator();
-
-    if (mask) {
-      NamedAttrList attributes = {};
-      attributes.append(StringRef("mask_complement"),
-                        rewriter.getBoolAttr(op.mask_complement()));
-      a = rewriter.create<graphblas::SelectMaskOp>(
-          loc, a.getType(), ValueRange{a, mask}, attributes.getAttrs());
-      b = rewriter.create<graphblas::SelectMaskOp>(
-          loc, b.getType(), ValueRange{b, mask}, attributes.getAttrs());
-    }
-
-    // Special handling for "first" and "second"
-    if (opstr == "first") {
-      graphblas::SelectMaskOp newIntersectOp =
-          rewriter.create<graphblas::SelectMaskOp>(loc, op->getResultTypes(),
-                                                   ValueRange{a, b});
-      rewriter.replaceOp(op, newIntersectOp.getResult());
-    } else if (opstr == "second") {
-      graphblas::SelectMaskOp newIntersectOp =
-          rewriter.create<graphblas::SelectMaskOp>(loc, op->getResultTypes(),
-                                                   ValueRange{b, a});
-      rewriter.replaceOp(op, newIntersectOp.getResult());
-    } else {
-      // New op
-      NamedAttrList attributes = {};
-      graphblas::IntersectGenericOp newIntersectOp =
-          rewriter.create<graphblas::IntersectGenericOp>(
-              loc, op->getResultTypes(), ValueRange{a, b},
-              attributes.getAttrs(), 1);
-
-      if (failed(populateBinary(rewriter, loc, op.intersect_operator(),
-                                valueType,
-                                newIntersectOp.getRegions().slice(0, 1),
-                                graphblas::YieldKind::MULT)))
-        return failure();
-
-      rewriter.setInsertionPointAfter(newIntersectOp);
-      rewriter.replaceOp(op, newIntersectOp.getResult());
-    }
-
-    return success();
-  };
-};
-
 class LowerIntersectGenericRewrite
     : public OpRewritePattern<graphblas::IntersectGenericOp> {
 public:
@@ -2974,101 +2449,6 @@ public:
     rewriter.replaceOp(op, output);
 
     cleanupIntermediateTensor(rewriter, module, loc, output);
-
-    return success();
-  };
-};
-
-class LowerUpdateRewrite : public OpRewritePattern<graphblas::UpdateOp> {
-public:
-  using OpRewritePattern<graphblas::UpdateOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::UpdateOp op,
-                                PatternRewriter &rewriter) const override {
-    ModuleOp module = op->getParentOfType<ModuleOp>();
-    Location loc = op->getLoc();
-
-    Type valueType =
-        op.input().getType().cast<RankedTensorType>().getElementType();
-    bool maskComplement = op.mask_complement();
-    bool replace = op.replace();
-    llvm::Optional<llvm::StringRef> accumulateOperator =
-        op.accumulate_operator();
-
-    // Use generic for accumulator
-    if (accumulateOperator) {
-      // New op
-      NamedAttrList attributes = {};
-      attributes.append(StringRef("mask_complement"),
-                        rewriter.getBoolAttr(maskComplement));
-      attributes.append(StringRef("replace"), rewriter.getBoolAttr(replace));
-      graphblas::UpdateGenericOp newUpdateOp =
-          rewriter.create<graphblas::UpdateGenericOp>(loc, op->getResultTypes(),
-                                                      op.getOperands(),
-                                                      attributes.getAttrs(), 1);
-
-      if (failed(populateBinary(rewriter, loc, accumulateOperator->str(),
-                                valueType, newUpdateOp.getRegions().slice(0, 1),
-                                graphblas::YieldKind::ACCUMULATE)))
-        return failure();
-
-      rewriter.setInsertionPointAfter(newUpdateOp);
-      rewriter.eraseOp(op);
-
-      return success();
-    }
-
-    // No accumulator; lower without generic op
-
-    Value input = op.input();
-    Value output = op.output();
-    Value mask = op.mask();
-
-    // Types
-    RankedTensorType outputType = output.getType().dyn_cast<RankedTensorType>();
-
-    unsigned rank = outputType.getRank(); // ranks guaranteed to be equal
-    auto computeEwise =
-        rank == 2 ? computeMatrixElementWise : computeVectorElementWise;
-
-    if (mask) {
-      EwiseBehavior maskBehavior = (maskComplement ? MASK_COMPLEMENT : MASK);
-      if (replace) {
-        // input -> output(mask) { replace }
-
-        computeEwise(rewriter, loc, module, input, mask, output, nullptr,
-                     maskBehavior);
-      } else {
-        // input -> output(mask)
-
-        // Step 1: apply the mask inverse to the output
-        EwiseBehavior maskInverseBehavior =
-            (maskComplement ? MASK : MASK_COMPLEMENT);
-        Value maskedOutput = callEmptyLike(rewriter, module, loc, output);
-        computeEwise(rewriter, loc, module, output, mask, maskedOutput, nullptr,
-                     maskInverseBehavior);
-        // Step 2: apply the mask to the input
-        Value maskedInput = callEmptyLike(rewriter, module, loc, input);
-        computeEwise(rewriter, loc, module, input, mask, maskedInput, nullptr,
-                     maskBehavior);
-        // Step 3: union the two masked results
-        // Note that there should be zero overlaps, so we do not provide
-        //      an accumulation block
-        computeEwise(rewriter, loc, module, maskedInput, maskedOutput, output,
-                     nullptr, UNION);
-        rewriter.create<sparse_tensor::ReleaseOp>(loc, maskedOutput);
-        rewriter.create<sparse_tensor::ReleaseOp>(loc, maskedInput);
-      }
-    } else {
-      // input -> output { replace? }
-
-      Value inputCopy = callDupTensor(rewriter, module, loc, input);
-      callSwapPointers(rewriter, module, loc, inputCopy, output);
-      callSwapIndices(rewriter, module, loc, inputCopy, output);
-      callSwapValues(rewriter, module, loc, inputCopy, output);
-      rewriter.create<sparse_tensor::ReleaseOp>(loc, inputCopy);
-    }
-
-    rewriter.eraseOp(op);
 
     return success();
   };
@@ -3151,6 +2531,79 @@ public:
       computeEwise(rewriter, loc, module, outputCopy, input, output,
                    extBlocks.accumulate, UNION);
       rewriter.create<sparse_tensor::ReleaseOp>(loc, outputCopy);
+    }
+
+    rewriter.eraseOp(op);
+
+    return success();
+  };
+};
+
+class LowerUpdateNoAccumulateRewrite
+    : public OpRewritePattern<graphblas::UpdateOp> {
+public:
+  using OpRewritePattern<graphblas::UpdateOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(graphblas::UpdateOp op,
+                                PatternRewriter &rewriter) const override {
+    ModuleOp module = op->getParentOfType<ModuleOp>();
+    Location loc = op->getLoc();
+
+    bool maskComplement = op.mask_complement();
+    bool replace = op.replace();
+    llvm::Optional<llvm::StringRef> accumulateOperator =
+        op.accumulate_operator();
+
+    // Accumulator should have been handled by generic version
+    if (accumulateOperator)
+      return failure();
+
+    Value input = op.input();
+    Value output = op.output();
+    Value mask = op.mask();
+
+    // Types
+    RankedTensorType outputType = output.getType().dyn_cast<RankedTensorType>();
+
+    unsigned rank = outputType.getRank(); // ranks guaranteed to be equal
+    auto computeEwise =
+        rank == 2 ? computeMatrixElementWise : computeVectorElementWise;
+
+    if (mask) {
+      EwiseBehavior maskBehavior = (maskComplement ? MASK_COMPLEMENT : MASK);
+      if (replace) {
+        // input -> output(mask) { replace }
+
+        computeEwise(rewriter, loc, module, input, mask, output, nullptr,
+                     maskBehavior);
+      } else {
+        // input -> output(mask)
+
+        // Step 1: apply the mask inverse to the output
+        EwiseBehavior maskInverseBehavior =
+            (maskComplement ? MASK : MASK_COMPLEMENT);
+        Value maskedOutput = callEmptyLike(rewriter, module, loc, output);
+        computeEwise(rewriter, loc, module, output, mask, maskedOutput, nullptr,
+                     maskInverseBehavior);
+        // Step 2: apply the mask to the input
+        Value maskedInput = callEmptyLike(rewriter, module, loc, input);
+        computeEwise(rewriter, loc, module, input, mask, maskedInput, nullptr,
+                     maskBehavior);
+        // Step 3: union the two masked results
+        // Note that there should be zero overlaps, so we do not provide
+        //      an accumulation block
+        computeEwise(rewriter, loc, module, maskedInput, maskedOutput, output,
+                     nullptr, UNION);
+        rewriter.create<sparse_tensor::ReleaseOp>(loc, maskedOutput);
+        rewriter.create<sparse_tensor::ReleaseOp>(loc, maskedInput);
+      }
+    } else {
+      // input -> output { replace? }
+
+      Value inputCopy = callDupTensor(rewriter, module, loc, input);
+      callSwapPointers(rewriter, module, loc, inputCopy, output);
+      callSwapIndices(rewriter, module, loc, inputCopy, output);
+      callSwapValues(rewriter, module, loc, inputCopy, output);
+      rewriter.create<sparse_tensor::ReleaseOp>(loc, inputCopy);
     }
 
     rewriter.eraseOp(op);
@@ -3488,10 +2941,10 @@ private:
     Type memref1DI64Type = MemRefType::get({-1}, int64Type);
     Type memref1DValueType = MemRefType::get({-1}, valueType);
 
-    Value c0_i64 =
-        rewriter.create<ConstantOp>(loc, rewriter.getIntegerAttr(int64Type, 0));
-    Value c1_i64 =
-        rewriter.create<ConstantOp>(loc, rewriter.getIntegerAttr(int64Type, 1));
+    Value c0_i64 = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(int64Type, 0));
+    Value c1_i64 = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(int64Type, 1));
 
     Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
@@ -3635,15 +3088,15 @@ private:
     Type memref1DI64Type = MemRefType::get({-1}, int64Type);
     Type memref1DValueType = MemRefType::get({-1}, valueType);
 
-    Value c1_i1 =
-        rewriter.create<ConstantOp>(loc, rewriter.getIntegerAttr(int1Type, 1));
+    Value c1_i1 = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(int1Type, 1));
     Value c0_valueType = llvm::TypeSwitch<Type, Value>(valueType)
                              .Case<IntegerType>([&](IntegerType type) {
-                               return rewriter.create<ConstantOp>(
+                               return rewriter.create<arith::ConstantOp>(
                                    loc, rewriter.getIntegerAttr(valueType, 1));
                              })
                              .Case<FloatType>([&](FloatType type) {
-                               return rewriter.create<ConstantOp>(
+                               return rewriter.create<arith::ConstantOp>(
                                    loc, rewriter.getFloatAttr(valueType, 1.0));
                              });
 
@@ -3706,12 +3159,12 @@ private:
 
       scf::WhileOp findDiagonalWhileLoop = rewriter.create<scf::WhileOp>(
           loc, TypeRange{indexType, int1Type}, ValueRange{firstPtr, c1_i1});
-      Block *findDiagonalWhileLoopBefore =
-          rewriter.createBlock(&findDiagonalWhileLoop.getBefore(), {},
-                               TypeRange{indexType, int1Type});
-      Block *findDiagonalWhileLoopAfter =
-          rewriter.createBlock(&findDiagonalWhileLoop.getAfter(), {},
-                               TypeRange{indexType, int1Type});
+      Block *findDiagonalWhileLoopBefore = rewriter.createBlock(
+          &findDiagonalWhileLoop.getBefore(), {},
+          TypeRange{indexType, int1Type}, ArrayRef<Location>{loc, loc});
+      Block *findDiagonalWhileLoopAfter = rewriter.createBlock(
+          &findDiagonalWhileLoop.getAfter(), {}, TypeRange{indexType, int1Type},
+          ArrayRef<Location>{loc, loc});
       Value diagonalNotFound = findDiagonalWhileLoop.getResult(1);
       {
         rewriter.setInsertionPointToStart(
@@ -3817,10 +3270,12 @@ private:
           ValueRange{firstPtr, c1_i1, c0_valueType});
       Block *findDiagonalWhileLoopBefore =
           rewriter.createBlock(&findDiagonalWhileLoop.getBefore(), {},
-                               TypeRange{indexType, int1Type, valueType});
+                               TypeRange{indexType, int1Type, valueType},
+                               ArrayRef<Location>{loc, loc, loc});
       Block *findDiagonalWhileLoopAfter =
           rewriter.createBlock(&findDiagonalWhileLoop.getAfter(), {},
-                               TypeRange{indexType, int1Type, valueType});
+                               TypeRange{indexType, int1Type, valueType},
+                               ArrayRef<Location>{loc, loc, loc});
       Value diagonalNotFound = findDiagonalWhileLoop.getResult(1);
       Value diagonalValue = findDiagonalWhileLoop.getResult(2);
       {
@@ -3909,72 +3364,6 @@ private:
   }
 };
 
-class LowerCommentRewrite : public OpRewritePattern<graphblas::CommentOp> {
-public:
-  using OpRewritePattern<graphblas::CommentOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::CommentOp op,
-                                PatternRewriter &rewriter) const override {
-    rewriter.eraseOp(op);
-    return success();
-  };
-};
-
-class LowerPrintRewrite : public OpRewritePattern<graphblas::PrintOp> {
-public:
-  using OpRewritePattern<graphblas::PrintOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::PrintOp op,
-                                PatternRewriter &rewriter) const override {
-
-    ModuleOp module = op->getParentOfType<ModuleOp>();
-    Location loc = op->getLoc();
-
-    for (auto enumerated_pair :
-         llvm::enumerate(llvm::zip_longest(op.strings(), op.values()))) {
-      auto pair = enumerated_pair.value();
-      Optional<Attribute> stringAttribute = std::get<0>(pair);
-      Optional<Value> val = std::get<1>(pair);
-
-      if (stringAttribute) {
-        StringRef currentString =
-            stringAttribute.getValue().dyn_cast<StringAttr>().getValue();
-        callPrintString(rewriter, module, loc, currentString);
-      } else if (enumerated_pair.index() != 0)
-        callPrintString(rewriter, module, loc, " ");
-
-      if (!val)
-        callPrintString(rewriter, module, loc, " ");
-      else if (val.getValue().getType().dyn_cast_or_null<RankedTensorType>())
-        callPrintTensor(rewriter, module, loc, val.getValue());
-      else
-        callPrintValue(rewriter, module, loc, val.getValue());
-    }
-    callPrintString(rewriter, module, loc, "\n");
-
-    rewriter.eraseOp(op);
-
-    return success();
-  };
-};
-
-class LowerPrintTensorRewrite
-    : public OpRewritePattern<graphblas::PrintTensorOp> {
-public:
-  using OpRewritePattern<graphblas::PrintTensorOp>::OpRewritePattern;
-  LogicalResult matchAndRewrite(graphblas::PrintTensorOp op,
-                                PatternRewriter &rewriter) const override {
-    ModuleOp module = op->getParentOfType<ModuleOp>();
-    Location loc = op->getLoc();
-    Value input = op.input();
-    int64_t level = op.level();
-
-    callPrintTensorComponents(rewriter, module, loc, input, level);
-
-    rewriter.eraseOp(op);
-
-    return success();
-  };
-};
-
 class LowerMatrixSelectRandomRewrite
     : public OpRewritePattern<graphblas::MatrixSelectRandomOp> {
 public:
@@ -4035,7 +3424,7 @@ public:
     Value isRowSmall = rewriter.create<arith::CmpIOp>(
         loc, arith::CmpIPredicate::ule, Aj_size_64, n);
     Value Bj_size_64 =
-        rewriter.create<SelectOp>(loc, isRowSmall, Aj_size_64, n);
+        rewriter.create<arith::SelectOp>(loc, isRowSmall, Aj_size_64, n);
 
     Value Bj_start_64 = rewriter.create<memref::LoadOp>(loc, Bp, row);
     Value Bj_end_64 =
@@ -4353,16 +3742,15 @@ public:
 
 void populateGraphBLASLoweringPatterns(RewritePatternSet &patterns) {
   patterns
-      .add<LowerMatrixSelectRandomRewrite, LowerSelectRewrite,
-           LowerSelectGenericRewrite, LowerReduceToVectorRewrite,
-           LowerReduceToVectorGenericRewrite, LowerReduceToScalarRewrite,
-           LowerReduceToScalarGenericRewrite, LowerConvertLayoutRewrite,
-           LowerCastRewrite, LowerTransposeRewrite, LowerApplyRewrite,
-           LowerApplyGenericRewrite, LowerUniformComplementRewrite,
+      .add<LowerMatrixSelectRandomRewrite, LowerSelectGenericRewrite,
+           LowerSelectCustomRewrite, LowerReduceToVectorGenericRewrite,
+           LowerReduceToVectorCustomRewrite, LowerReduceToScalarGenericRewrite,
+           LowerReduceToScalarCustomRewrite, LowerConvertLayoutRewrite,
+           LowerCastRewrite, LowerTransposeRewrite, LowerApplyGenericRewrite,
+           LowerUniformComplementRewrite,
            LowerMatrixMultiplyReduceToScalarGenericRewrite,
-           LowerMatrixMultiplyRewrite, LowerMatrixMultiplyGenericRewrite,
-           LowerUnionRewrite, LowerUnionGenericRewrite, LowerIntersectRewrite,
-           LowerIntersectGenericRewrite, LowerUpdateRewrite,
+           LowerMatrixMultiplyGenericRewrite, LowerUnionGenericRewrite,
+           LowerIntersectGenericRewrite, LowerUpdateNoAccumulateRewrite,
            LowerUpdateGenericRewrite, LowerEqualRewrite, LowerDiagOpRewrite,
            LowerSelectMaskRewrite, LowerCommentRewrite, LowerPrintRewrite,
            LowerPrintTensorRewrite, LowerSizeRewrite, LowerNumRowsRewrite,
@@ -4382,39 +3770,8 @@ struct GraphBLASLoweringPass
     target.addIllegalDialect<graphblas::GraphBLASDialect>();
   }
 };
-
-void populateGraphBLASStructuralizePatterns(RewritePatternSet &patterns) {
-  patterns
-      .add<TransposeDWIMRewrite, ReduceToVectorDWIMRewrite,
-           MatrixMultiplyGenericDWIMFirstArgRewrite,
-           MatrixMultiplyGenericDWIMSecondArgRewrite,
-           MatrixMultiplyGenericDWIMMaskRewrite,
-           MatrixMultiplyReduceToScalarGenericDWIMFirstArgRewrite,
-           MatrixMultiplyReduceToScalarGenericDWIMSecondArgRewrite,
-           MatrixMultiplyReduceToScalarGenericDWIMMaskRewrite,
-           LowerMatrixMultiplyRewrite, LowerApplyRewrite, LowerSelectRewrite,
-           LowerUnionRewrite, LowerIntersectRewrite, LowerUpdateRewrite,
-           LowerReduceToVectorRewrite, LowerReduceToScalarRewrite>(
-          patterns.getContext());
-}
-
-struct GraphBLASStructuralizePass
-    : public GraphBLASStructuralizeBase<GraphBLASStructuralizePass> {
-  void runOnOperation() override {
-    MLIRContext *ctx = &getContext();
-    RewritePatternSet patterns(ctx);
-    ConversionTarget target(*ctx);
-    populateGraphBLASStructuralizePatterns(patterns);
-    (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
-  }
-};
 } // end anonymous namespace
 
 std::unique_ptr<OperationPass<ModuleOp>> mlir::createGraphBLASLoweringPass() {
   return std::make_unique<GraphBLASLoweringPass>();
-}
-
-std::unique_ptr<OperationPass<ModuleOp>>
-mlir::createGraphBLASStructuralizePass() {
-  return std::make_unique<GraphBLASStructuralizePass>();
 }

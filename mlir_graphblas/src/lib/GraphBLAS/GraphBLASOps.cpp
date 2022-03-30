@@ -295,12 +295,28 @@ static LogicalResult verify(ApplyOp op) {
   if (argResult.failed())
     return argResult;
 
+  bool inPlace = op.in_place();
+  RankedTensorType inputTensorType = inputType.cast<RankedTensorType>();
+  RankedTensorType resultTensorType =
+      op.getResult().getType().cast<RankedTensorType>();
+  if (inPlace && inputTensorType != resultTensorType) {
+    return op.emitError(
+        "operand and result types must match when changes are in-place.");
+  }
+
   std::string applyOperator = op.apply_operator().str();
   if (!supportedForApply.contains(applyOperator))
     return op.emitError("\"" + applyOperator +
                         "\" is not a supported operator.");
 
-  if (binary2.contains(applyOperator) || binary4.contains(applyOperator)) {
+  if (unary1.contains(applyOperator) || unary3.contains(applyOperator)) {
+
+    if (thunk)
+      return op.emitError("\"" + applyOperator +
+                          "\""
+                          " is a unary operator, but was given a thunk.");
+  } else if (binary2.contains(applyOperator) ||
+             binary4.contains(applyOperator)) {
 
     if (!thunk)
       return op.emitError("\"" + applyOperator +
@@ -318,23 +334,26 @@ static LogicalResult verify(ApplyOp op) {
         binary2.contains(applyOperator))
       return op.emitError(
           "Element type of input tensor does not match type of thunk.");
-
-  } else if (unary1.contains(applyOperator) || unary3.contains(applyOperator)) {
-
-    if (thunk)
-      return op.emitError("\"" + applyOperator +
-                          "\""
-                          " is a unary operator, but was given a thunk.");
   }
 
   return success();
 }
 
 static LogicalResult verify(ApplyGenericOp op) {
-  LogicalResult argResult = verifyApplyArgs(op, op.input().getType());
+  Type inputType = op.input().getType();
+  LogicalResult argResult = verifyApplyArgs(op, inputType);
 
   if (argResult.failed())
     return argResult;
+
+  bool inPlace = op.in_place();
+  RankedTensorType inputTensorType = inputType.cast<RankedTensorType>();
+  RankedTensorType resultTensorType =
+      op.getResult().getType().cast<RankedTensorType>();
+  if (inPlace && inputTensorType != resultTensorType) {
+    return op.emitError(
+        "operand and result types must match when changes are in-place.");
+  }
 
   RegionRange extensions = op.extensions();
   if (extensions.size() < 1) {
@@ -881,14 +900,6 @@ static LogicalResult verify(ReduceToVectorGenericOp op) {
   if (extensions.size() < 2) {
     return op.emitError("Must have at least 2 regions: agg_identity, agg.");
   }
-
-  // Enforce reasonable iteration direction for axis
-  bool isCSR = hasRowOrdering(op.input().getType());
-  int axis = op.axis();
-  if (axis == 0 && isCSR)
-    return op.emitError("Reducing with axis=0 requires CSC matrix.");
-  if (axis == 1 && !isCSR)
-    return op.emitError("Reducing with axis=1 requires CSR matrix.");
 
   return success();
 }

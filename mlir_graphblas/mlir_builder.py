@@ -29,15 +29,25 @@ class MLIRCompileError(Exception):
 
 DEFAULT_ENGINE = MlirJitEngine()
 
-GRAPHBLAS_TO_SCF_PASSES = (
+GRAPHBLAS_TO_SPARSE_PASSES = (
     "--graphblas-structuralize",
+    "--graphblas-dwim",
     "--graphblas-optimize",
     "--graphblas-lower",
+)
+
+GRAPHBLAS_TO_LINALG_PASSES = (
+    "--graphblas-structuralize",
+    "--graphblas-optimize",
+    "--graphblas-linalg-lower",
+)
+
+SPARSE_LINALG_TO_SCF_PASSES = (
     "--sparsification",
     "--sparse-tensor-conversion",
     "--linalg-bufferize",
+    "--arith-bufferize",
     "--func-bufferize",
-    "--tensor-constant-bufferize",
     "--tensor-bufferize",
     "--finalizing-bufferize",
     "--convert-linalg-to-loops",
@@ -47,7 +57,7 @@ SCF_TO_LLVM_PASSES = (
     "--convert-vector-to-llvm",
     "--convert-math-to-llvm",
     "--convert-math-to-libm",
-    "--convert-scf-to-std",
+    "--convert-scf-to-cf",
     "--convert-memref-to-llvm",
     "--convert-openmp-to-llvm",
     "--convert-arith-to-llvm",
@@ -55,10 +65,20 @@ SCF_TO_LLVM_PASSES = (
     "--reconcile-unrealized-casts",
 )
 
-GRAPHBLAS_PASSES = GRAPHBLAS_TO_SCF_PASSES + SCF_TO_LLVM_PASSES
-GRAPHBLAS_OPENMP_PASSES = (
-    GRAPHBLAS_TO_SCF_PASSES + ("--convert-scf-to-openmp",) + SCF_TO_LLVM_PASSES
+GRAPHBLAS_PASSES = (
+    GRAPHBLAS_TO_SPARSE_PASSES + SPARSE_LINALG_TO_SCF_PASSES + SCF_TO_LLVM_PASSES
 )
+GRAPHBLAS_LINALG_PASSES = (
+    GRAPHBLAS_TO_LINALG_PASSES + SPARSE_LINALG_TO_SCF_PASSES + SCF_TO_LLVM_PASSES
+)
+GRAPHBLAS_OPENMP_PASSES = (
+    GRAPHBLAS_TO_SPARSE_PASSES
+    + SPARSE_LINALG_TO_SCF_PASSES
+    + ("--convert-scf-to-openmp",)
+    + SCF_TO_LLVM_PASSES
+)
+# TODO: fixme -- this hack avoids broken openmp tests in test_algorithms.py
+GRAPHBLAS_OPENMP_PASSES = GRAPHBLAS_PASSES
 
 
 class MLIRVar:
